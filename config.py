@@ -1,0 +1,239 @@
+from __future__ import annotations
+
+from copy import deepcopy
+from pathlib import Path
+import xml.etree.ElementTree as ET
+
+import torch
+
+ORGANIZE_ROOT = Path(__file__).resolve().parent
+COMB2_ROOT = ORGANIZE_ROOT.parent / "comb2"
+PCM_ROOT = ORGANIZE_ROOT.parent / "comb2-pcmaster"
+
+DEFAULT_CONFIG = {
+    "strategy": {
+        "start_ds": 20160111,
+        "end_ds": 20200101,
+    },
+    "combo": {
+        "paths": {
+            "base_dir": str(COMB2_ROOT),
+            "output_dir": str(COMB2_ROOT / "output"),
+            "model_path": str(COMB2_ROOT / "lgbm_model.py"),
+            "checkpoint_root": None,
+        },
+        "output": {
+            "alpha_history_path": str(COMB2_ROOT / "output" / "alpha_history.pt"),
+            "log_path": str(COMB2_ROOT / "output" / "train.log"),
+        },
+        "runtime": {
+            "snaptime": "mlp_minimal",
+            "livetrading": False,
+            "trainDelay": 1,
+            "retDays": 1,
+            "tsDays": 8,
+            "model_smooth_rate": 0.7,
+            "model_keep_num": 2,
+            "select_days": 100,
+            "max_train_days": 2000,
+        },
+        "model": {
+            "device": "cpu",
+            "hiddenSize": 16,
+            "lr": 0.05,
+            "epochs": 100,
+            "num_leaves": 31,
+            "feature_fraction": 0.8,
+            "bagging_fraction": 0.8,
+            "bagging_freq": 1,
+            "min_data_in_leaf": 100,
+            "num_threads": -1,
+            "seed": 42,
+        },
+        "loader": {
+            "factor_paths": (
+                "/home/shared/data1/factorsim_data/Factor/FactorData/ZsimPool/yz_20250219_02",
+                "/home/shared/data1/factorsim_data/Factor/FactorData/ZsimPool/wjx_20240829_02",
+                "/home/shared/data1/factorsim_data/Factor/FactorData/ZsimPool/guanxl_05",
+                "/home/shared/data1/factorsim_data/Factor/FactorData/ZsimPool/alpha1_20251008_01",
+                "/home/shared/data1/factorsim_data/Factor/FactorData/ZsimPool/alpha2_20251008_02",
+                "/home/shared/data1/factorsim_data/Factor/FactorData/ZsimPool/alpha3_20251008_03",
+                "/home/shared/data1/factorsim_data/Factor/FactorData/ZsimPool/alpha4_20251008_04",
+                "/home/shared/data1/factorsim_data/Factor/FactorData/ZsimPool/alpha5_20251008_05",
+            ),
+            "label_path": "/home/shared/data1/factorsim_data/Cache/AshareCache/1d_DailyLabel/DailyLabel.label1d",
+            "dtype": torch.float16,
+            "data_start_ds": 20160101,
+            "valid_path": "/home/shared/data1/factorsim_data/Cache/AshareCache/Ashare",
+            "filtered_path": "/home/shared/data1/factorsim_data/Cache/AshareCache/AshareFiltered",
+        },
+        "defaults": {
+            "selection_module": None,
+        },
+    },
+    "backtest": {
+        "output_path": str(COMB2_ROOT / "output" / "backtest"),
+        "daily_metrics_file": "daily_pnl.csv",
+        "cash": 10000000.0,
+        "fee_rate": 0.0015,
+        "reserve_cash": 0.95,
+        "verbose": False,
+        "universe": "base",
+    },
+}
+
+DTYPE_MAP = {
+    "float16": torch.float16,
+    "float32": torch.float32,
+    "float64": torch.float64,
+    "bfloat16": torch.bfloat16,
+}
+
+PATH_FIELDS = {
+    ("combo", "paths", "base_dir"),
+    ("combo", "paths", "output_dir"),
+    ("combo", "paths", "model_path"),
+    ("combo", "paths", "checkpoint_root"),
+    ("combo", "output", "alpha_history_path"),
+    ("combo", "output", "log_path"),
+    ("combo", "loader", "label_path"),
+    ("combo", "loader", "valid_path"),
+    ("combo", "loader", "filtered_path"),
+    ("backtest", "output_path"),
+}
+
+
+def _deep_merge(base: dict, override: dict) -> dict:
+    merged = deepcopy(base)
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _deep_merge(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def _parse_bool(value: str) -> bool:
+    lowered = value.strip().lower()
+    if lowered in {"1", "true", "yes", "y", "on"}:
+        return True
+    if lowered in {"0", "false", "no", "n", "off"}:
+        return False
+    raise ValueError(f"invalid boolean value: {value}")
+
+
+def _parse_dtype(value: str) -> torch.dtype:
+    lowered = value.strip().lower()
+    if lowered not in DTYPE_MAP:
+        raise ValueError(f"unsupported dtype: {value}")
+    return DTYPE_MAP[lowered]
+
+
+def _coerce_like(default_value, value: str):
+    if value is None:
+        return None
+    if default_value is None:
+        stripped = value.strip()
+        return None if stripped == "" else stripped
+    if isinstance(default_value, bool):
+        return _parse_bool(value)
+    if isinstance(default_value, int) and not isinstance(default_value, bool):
+        return int(value)
+    if isinstance(default_value, float):
+        return float(value)
+    if isinstance(default_value, torch.dtype):
+        return _parse_dtype(value)
+    if isinstance(default_value, (tuple, list)):
+        raise TypeError("sequence values must be parsed explicitly")
+    return value
+
+
+def _parse_section_attributes(element: ET.Element | None, default_section: dict) -> dict:
+    if element is None:
+        return {}
+    parsed = {}
+    for key, raw in element.attrib.items():
+        if key not in default_section:
+            raise ValueError(f"unsupported config key '{key}' in <{element.tag}>")
+        parsed[key] = _coerce_like(default_section[key], raw)
+    return parsed
+
+
+def _parse_factor_paths(loader_element: ET.Element | None, default_paths) -> tuple[str, ...] | None:
+    if loader_element is None:
+        return None
+    factor_paths_element = loader_element.find("factor_paths")
+    if factor_paths_element is None:
+        return None
+    paths = []
+    for path_element in factor_paths_element.findall("path"):
+        path_value = (path_element.text or "").strip()
+        if path_value:
+            paths.append(path_value)
+    if not paths:
+        return tuple(default_paths)
+    return tuple(paths)
+
+
+def _resolve_path(value: str | None) -> str | None:
+    if value is None:
+        return None
+    return str(Path(value).expanduser().resolve())
+
+
+def _resolve_loaded_paths(config: dict) -> dict:
+    resolved = deepcopy(config)
+    for path_key in PATH_FIELDS:
+        section = resolved
+        for key in path_key[:-1]:
+            section = section[key]
+        leaf_key = path_key[-1]
+        if leaf_key in section:
+            section[leaf_key] = _resolve_path(section[leaf_key])
+
+    factor_paths = resolved["combo"]["loader"].get("factor_paths")
+    if factor_paths is not None:
+        resolved["combo"]["loader"]["factor_paths"] = tuple(_resolve_path(path) for path in factor_paths)
+    return resolved
+
+
+def _load_xml_config(path: str) -> dict:
+    root = ET.parse(path).getroot()
+    if root.tag != "config":
+        raise ValueError("xml config root tag must be <config>")
+
+    strategy = _parse_section_attributes(root.find("strategy"), DEFAULT_CONFIG["strategy"])
+
+    combo_element = root.find("combo")
+    combo = {}
+    if combo_element is not None:
+        combo = {
+            "paths": _parse_section_attributes(combo_element.find("paths"), DEFAULT_CONFIG["combo"]["paths"]),
+            "output": _parse_section_attributes(combo_element.find("output"), DEFAULT_CONFIG["combo"]["output"]),
+            "runtime": _parse_section_attributes(combo_element.find("runtime"), DEFAULT_CONFIG["combo"]["runtime"]),
+            "model": _parse_section_attributes(combo_element.find("model"), DEFAULT_CONFIG["combo"]["model"]),
+            "loader": _parse_section_attributes(combo_element.find("loader"), DEFAULT_CONFIG["combo"]["loader"]),
+            "defaults": _parse_section_attributes(combo_element.find("defaults"), DEFAULT_CONFIG["combo"]["defaults"]),
+        }
+        factor_paths = _parse_factor_paths(combo_element.find("loader"), DEFAULT_CONFIG["combo"]["loader"]["factor_paths"])
+        if factor_paths is not None:
+            combo["loader"]["factor_paths"] = factor_paths
+
+    backtest = _parse_section_attributes(root.find("backtest"), DEFAULT_CONFIG["backtest"])
+
+    return {
+        "strategy": strategy,
+        "combo": combo,
+        "backtest": backtest,
+    }
+
+
+def load_config(path: str | None = None) -> dict:
+    if path is None:
+        return deepcopy(DEFAULT_CONFIG)
+    suffix = Path(path).suffix.lower()
+    if suffix != ".xml":
+        raise ValueError("config file must be an XML file")
+    loaded = _load_xml_config(path)
+    merged = _deep_merge(DEFAULT_CONFIG, loaded)
+    return _resolve_loaded_paths(merged)
