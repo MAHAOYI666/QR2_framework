@@ -48,22 +48,21 @@ class ComboBase:
         self.research_model_cls = self._load_research_model_class(self.model_path)
 
     def _model_config(self) -> dict[str, Any]:
-        return {
-            "dtype": self.loader.dtype,
-            "tsDays": self.tsDays,
-            "num_features": self.loader.num_features,
-            "device": getattr(self.node, "device", "cpu"),
-            "hidden_size": getattr(self.node, "hiddenSize", 64),
-            "lr": getattr(self.node, "lr", 1e-3),
-            "epochs": getattr(self.node, "epochs", 1),
-            "num_leaves": getattr(self.node, "num_leaves", 31),
-            "feature_fraction": getattr(self.node, "feature_fraction", 0.8),
-            "bagging_fraction": getattr(self.node, "bagging_fraction", 0.8),
-            "bagging_freq": getattr(self.node, "bagging_freq", 1),
-            "min_data_in_leaf": getattr(self.node, "min_data_in_leaf", 100),
-            "num_threads": getattr(self.node, "num_threads", -1),
-            "seed": getattr(self.node, "seed", 42),
-        }
+        model_config = dict(getattr(self.node, "model_config", {}))
+        model_config.update(
+            {
+                "dtype": self.loader.dtype,
+                "tsDays": self.tsDays,
+                "num_features": self.loader.num_features,
+            }
+        )
+        if "hiddenSize" in model_config:
+            model_config.setdefault("hidden_size", model_config["hiddenSize"])
+        if "fcSize" in model_config:
+            model_config.setdefault("fc_size", model_config["fcSize"])
+        if "batchSize" in model_config:
+            model_config.setdefault("batch_size", model_config["batchSize"])
+        return model_config
 
     def _load_research_model_class(self, model_path: str):
         if not os.path.exists(model_path):

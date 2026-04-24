@@ -44,19 +44,7 @@ DEFAULT_CONFIG = {
             "select_days": 100,
             "max_train_days": 2000,
         },
-        "model": {
-            "device": "cpu",
-            "hiddenSize": 16,
-            "lr": 0.05,
-            "epochs": 100,
-            "num_leaves": 31,
-            "feature_fraction": 0.8,
-            "bagging_fraction": 0.8,
-            "bagging_freq": 1,
-            "min_data_in_leaf": 100,
-            "num_threads": -1,
-            "seed": 42,
-        },
+        "model": {},
         "loader": {
             "factor_paths": (
                 "yz_20250219_02",
@@ -163,13 +151,31 @@ def _coerce_like(default_value, value: str):
     return value
 
 
-def _parse_section_attributes(element: ET.Element | None, default_section: dict) -> dict:
+def _parse_scalar(value: str):
+    stripped = value.strip()
+    lowered = stripped.lower()
+    if lowered in {"true", "false", "yes", "no", "y", "n", "on", "off"}:
+        return _parse_bool(stripped)
+    try:
+        return int(stripped)
+    except ValueError:
+        pass
+    try:
+        return float(stripped)
+    except ValueError:
+        return stripped
+
+
+def _parse_section_attributes(element: ET.Element | None, default_section: dict, allow_extra: bool = False) -> dict:
     if element is None:
         return {}
     parsed = {}
     for key, raw in element.attrib.items():
         if key not in default_section:
-            raise ValueError(f"unsupported config key '{key}' in <{element.tag}>")
+            if not allow_extra:
+                raise ValueError(f"unsupported config key '{key}' in <{element.tag}>")
+            parsed[key] = _parse_scalar(raw)
+            continue
         parsed[key] = _coerce_like(default_section[key], raw)
     return parsed
 
@@ -257,7 +263,7 @@ def _load_xml_config(path: str) -> dict:
             "paths": _parse_section_attributes(combo_element.find("paths"), DEFAULT_CONFIG["combo"]["paths"]),
             "output": _parse_section_attributes(combo_element.find("output"), DEFAULT_CONFIG["combo"]["output"]),
             "runtime": _parse_section_attributes(combo_element.find("runtime"), DEFAULT_CONFIG["combo"]["runtime"]),
-            "model": _parse_section_attributes(combo_element.find("model"), DEFAULT_CONFIG["combo"]["model"]),
+            "model": _parse_section_attributes(combo_element.find("model"), DEFAULT_CONFIG["combo"]["model"], allow_extra=True),
             "loader": _parse_section_attributes(combo_element.find("loader"), DEFAULT_CONFIG["combo"]["loader"]),
             "defaults": _parse_section_attributes(combo_element.find("defaults"), DEFAULT_CONFIG["combo"]["defaults"]),
         }

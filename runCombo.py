@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import sys
+from dataclasses import fields
 from pathlib import Path
 
 import numpy as np
@@ -37,7 +38,9 @@ class Node:
             for key, value in config[section].items():
                 setattr(self, key, value)
 
-        self.loader_config = LoaderConfig(**config["loader"])
+        self.model_config = dict(config["model"])
+        loader_fields = {field.name for field in fields(LoaderConfig)}
+        self.loader_config = LoaderConfig(**{key: value for key, value in config["loader"].items() if key in loader_fields})
 
 
 def print_daily_metrics(metrics: dict):

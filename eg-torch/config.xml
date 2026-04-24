@@ -16,9 +16,9 @@
     <runtime
       snaptime="example_torch"
       livetrading="false"
-      trainDelay="1"
-      retDays="1"
-      tsDays="8"
+      trainDelay="0"
+      retDays="5"
+      tsDays="5"
       model_smooth_rate="0.7"
       model_keep_num="0"
       select_days="100"
@@ -27,15 +27,12 @@
 
     <model
       device="cpu"
-      hiddenSize="64"
-      lr="0.001"
-      epochs="5"
-      num_leaves="31"
-      feature_fraction="0.8"
-      bagging_fraction="0.8"
-      bagging_freq="1"
-      min_data_in_leaf="100"
-      num_threads="-1"
+      hiddenSize="512"
+      fcSize="256"
+      dropout="0.5"
+      lr="0.000002"
+      epochs="15"
+      batchSize="3"
       seed="42"
     />
 
