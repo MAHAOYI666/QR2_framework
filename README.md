@@ -19,14 +19,14 @@ vendor/
 
 ## research 流程示例
 
-下面以 `comb2-example-lgbm` 为例说明完整流程。
+下面以 `eg-lgbm` 为例说明完整流程。
 
 ### 1. 准备 research 目录
 
 示例目录结构如下：
 
 ```text
-comb2-example-lgbm/
+eg-lgbm/
   model.py
   config.xml
   output/
@@ -41,7 +41,7 @@ comb2-example-lgbm/
 
 ### 2. 编写 research 模型
 
-可以参考 `comb2-example-lgbm/model.py`。模型需要提供一个 `ResearchModel` 类，并实现以下接口：
+可以参考 `eg-lgbm/model.py`。模型需要提供一个 `ResearchModel` 类，并实现以下接口：
 
 - `fit(dataset)`
 - `predict(x_window)`
@@ -50,13 +50,31 @@ comb2-example-lgbm/
 
 ### 3. 编写配置文件
 
-可以参考 `comb2-example-lgbm/config.xml`。
+可以参考 `eg-lgbm/config.xml`。
+
+所有 XML 里的相对路径都会按 `config.xml` 所在目录解析，不依赖运行命令时的当前目录。换机器时，通常只需要修改 `<constants>` 中的机器相关根目录。
 
 关键配置包括：
+- `constants.cache_path`：行情、mask、label 等缓存数据根目录
+- `constants.factor_root`：相对因子路径的根目录，程序不会自动追加 `ZsimPool`
+- `constants.output_root`：日志、alpha、回测输出的根目录
+- `constants.checkpoint_root`：模型 checkpoint 输出目录
 - `combo.paths.model_path`：指向 research 目录下的 `model.py`
 - `combo.paths.checkpoint_root`：checkpoint 输出目录
 - `combo.paths.output_dir`：日志和中间结果输出目录
 - `backtest.output_path`：回测结果输出目录
+
+如果因子在 `ZsimPool` 下，需要显式写在 `constants.factor_root` 里，例如：
+
+```xml
+<constants factor_root="/path/to/FactorData/ZsimPool" />
+```
+
+也可以保持 `factor_root` 为更上层目录，然后在 `<path>` 中显式写相对路径：
+
+```xml
+<path>ZsimPool/yz_20250219_02</path>
+```
 
 示例里：
 - `model_path="model.py"`
@@ -69,13 +87,13 @@ comb2-example-lgbm/
 可以从任意目录执行：
 
 ```bash
-python3 /root/autodl-tmp/comb2-organize/runCombo.py /root/autodl-tmp/comb2-example-lgbm/config.xml
+python3 /path/to/comb2-organize/runCombo.py /path/to/research/config.xml
 ```
 
 或者：
 
 ```bash
-python3 /root/autodl-tmp/comb2-organize/runCombo.py --config /root/autodl-tmp/comb2-example-lgbm/config.xml
+python3 /path/to/comb2-organize/runCombo.py --config /path/to/research/config.xml
 ```
 
 研究员只需要把命令里的 `runCombo.py` 和 `config.xml` 换成自己的实际路径。

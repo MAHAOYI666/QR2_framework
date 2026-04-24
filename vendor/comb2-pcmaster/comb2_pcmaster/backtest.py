@@ -26,6 +26,7 @@ class BacktestNode:
     fee_rate: float
     reserve_cash: float
     daily_metrics_file: str = "daily_metrics.csv"
+    cache_path: str = ""
     verbose: bool = False
     universe: str = "base"
     holdings: pd.Series | None = None
@@ -47,7 +48,7 @@ class DailyBacktest:
         self.node = node
         os.makedirs(self.node.output_path, exist_ok=True)
         self.trade_date = sorted(IndexMask().date)
-        self.dataloader = DataLoader(signal_path="")
+        self.dataloader = DataLoader(signal_path="", cache_path=self.node.cache_path)
         self.strategy = self._init_strategy()
         self._init_universe()
         self._load_market_data()

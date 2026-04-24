@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
-import os
 import sys
 from pathlib import Path
 
@@ -132,7 +131,7 @@ def dump_alpha_analysis(node: Node, combo_config: dict):
     alpha_path = output_dir / "alpha.parquet"
     alpha.to_parquet(alpha_path)
 
-    ashare_data_path = os.path.dirname(os.path.dirname(combo_config["loader"]["label_path"]))
+    ashare_data_path = combo_config["loader"]["ashare_data_path"]
     daily_ic = calculate_alpha_ic(alpha, ashare_data_path)
     daily_ic_path = output_dir / "daily_ic"
     daily_ic.to_csv(daily_ic_path, sep="\t", na_rep="NAN")
@@ -158,6 +157,7 @@ def build_backtest_node(strategy_path: Path, organize_config: dict) -> BacktestN
         fee_rate=float(backtest_config["fee_rate"]),
         reserve_cash=float(backtest_config["reserve_cash"]),
         daily_metrics_file=backtest_config.get("daily_metrics_file", "daily_metrics.csv"),
+        cache_path=organize_config["constants"]["cache_path"],
         verbose=bool(backtest_config["verbose"]),
         universe=backtest_config.get("universe", "base"),
     )

@@ -13,8 +13,8 @@ PCM_ROOT = VENDOR_ROOT / "comb2-pcmaster"
 
 DEFAULT_CONFIG = {
     "constants": {
-        "cache_path": "/home/shared/data1/factorsim_data/Cache",
-        "factor_root": "/home/shared/data1/factorsim_data/Factor/FactorData",
+        "cache_path": "data/Cache",
+        "factor_root": "data/Factor/FactorData",
         "output_root": str(COMB2_ROOT / "output"),
         "checkpoint_root": None,
     },
@@ -59,21 +59,22 @@ DEFAULT_CONFIG = {
         },
         "loader": {
             "factor_paths": (
-                "/home/shared/data1/factorsim_data/Factor/FactorData/ZsimPool/yz_20250219_02",
-                "/home/shared/data1/factorsim_data/Factor/FactorData/ZsimPool/wjx_20240829_02",
-                "/home/shared/data1/factorsim_data/Factor/FactorData/ZsimPool/guanxl_05",
-                "/home/shared/data1/factorsim_data/Factor/FactorData/ZsimPool/alpha1_20251008_01",
-                "/home/shared/data1/factorsim_data/Factor/FactorData/ZsimPool/alpha2_20251008_02",
-                "/home/shared/data1/factorsim_data/Factor/FactorData/ZsimPool/alpha3_20251008_03",
-                "/home/shared/data1/factorsim_data/Factor/FactorData/ZsimPool/alpha4_20251008_04",
-                "/home/shared/data1/factorsim_data/Factor/FactorData/ZsimPool/alpha5_20251008_05",
+                "yz_20250219_02",
+                "wjx_20240829_02",
+                "guanxl_05",
+                "alpha1_20251008_01",
+                "alpha2_20251008_02",
+                "alpha3_20251008_03",
+                "alpha4_20251008_04",
+                "alpha5_20251008_05",
             ),
-            "label_path": "/home/shared/data1/factorsim_data/Cache/AshareCache/1d_DailyLabel/DailyLabel.label1d",
+            "label_path": None,
+            "ashare_data_path": None,
             "dtype": torch.float16,
             "data_start_ds": 20160101,
-            "valid_path": "/home/shared/data1/factorsim_data/Cache/AshareCache/Ashare",
-            "filtered_path": "/home/shared/data1/factorsim_data/Cache/AshareCache/AshareFiltered",
-            "base_universe_path": "/home/shared/data1/factorsim_data/Cache/AshareCache/1d_StockMask2/StockMask2.BaseUnivMask",
+            "valid_path": None,
+            "filtered_path": None,
+            "base_universe_path": None,
         },
         "defaults": {
             "selection_module": None,
@@ -109,6 +110,7 @@ PATH_FIELDS = {
     ("combo", "output", "alpha_history_path"),
     ("combo", "output", "log_path"),
     ("combo", "loader", "label_path"),
+    ("combo", "loader", "ashare_data_path"),
     ("combo", "loader", "valid_path"),
     ("combo", "loader", "filtered_path"),
     ("combo", "loader", "base_universe_path"),
@@ -188,10 +190,13 @@ def _parse_factor_paths(loader_element: ET.Element | None, default_paths) -> tup
     return tuple(paths)
 
 
-def _resolve_path(value: str | None) -> str | None:
+def _resolve_path(value: str | None, base_dir: Path) -> str | None:
     if value is None:
         return None
-    return str(Path(value).expanduser().resolve())
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        path = base_dir / path
+    return str(path.resolve())
 
 
 def _resolve_factor_path(factor_root: str, path: str) -> str:
@@ -212,6 +217,7 @@ def _apply_constant_paths(config: dict) -> dict:
     updated["combo"]["output"]["alpha_history_path"] = str(output_root / "alpha_history.pt")
     updated["combo"]["output"]["log_path"] = str(output_root / "train.log")
     updated["combo"]["loader"]["label_path"] = str(cache_path / "1d_DailyLabel" / "DailyLabel.label1d")
+    updated["combo"]["loader"]["ashare_data_path"] = str(cache_path)
     updated["combo"]["loader"]["valid_path"] = str(cache_path / "Ashare")
     updated["combo"]["loader"]["filtered_path"] = str(cache_path / "AshareFiltered")
     updated["combo"]["loader"]["base_universe_path"] = str(cache_path / "1d_StockMask2" / "StockMask2.BaseUnivMask")
@@ -219,7 +225,7 @@ def _apply_constant_paths(config: dict) -> dict:
     return updated
 
 
-def _resolve_loaded_paths(config: dict) -> dict:
+def _resolve_loaded_paths(config: dict, base_dir: Path) -> dict:
     resolved = _apply_constant_paths(config)
     for path_key in PATH_FIELDS:
         section = resolved
@@ -227,11 +233,11 @@ def _resolve_loaded_paths(config: dict) -> dict:
             section = section[key]
         leaf_key = path_key[-1]
         if leaf_key in section:
-            section[leaf_key] = _resolve_path(section[leaf_key])
+            section[leaf_key] = _resolve_path(section[leaf_key], base_dir)
 
     factor_paths = resolved["combo"]["loader"].get("factor_paths")
     if factor_paths is not None:
-        factor_root = str(Path(resolved["constants"]["factor_root"]) / "ZsimPool")
+        factor_root = resolved["constants"]["factor_root"]
         resolved["combo"]["loader"]["factor_paths"] = tuple(_resolve_factor_path(factor_root, path) for path in factor_paths)
     return resolved
 
@@ -271,10 +277,10 @@ def _load_xml_config(path: str) -> dict:
 
 def load_config(path: str | None = None) -> dict:
     if path is None:
-        return deepcopy(DEFAULT_CONFIG)
-    suffix = Path(path).suffix.lower()
-    if suffix != ".xml":
+        return _resolve_loaded_paths(deepcopy(DEFAULT_CONFIG), ORGANIZE_ROOT)
+    config_path = Path(path).expanduser().resolve()
+    if config_path.suffix.lower() != ".xml":
         raise ValueError("config file must be an XML file")
-    loaded = _load_xml_config(path)
+    loaded = _load_xml_config(str(config_path))
     merged = _deep_merge(DEFAULT_CONFIG, loaded)
-    return _resolve_loaded_paths(merged)
+    return _resolve_loaded_paths(merged, config_path.parent)

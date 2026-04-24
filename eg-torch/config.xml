@@ -2,8 +2,8 @@
   <constants
     cache_path="/home/shared/data1/factorsim_data/Cache"
     factor_root="/home/shared/data1/factorsim_data/Factor/FactorData/ZsimPool"
-    output_root="output"
-    checkpoint_root="checkpoints"
+    output_root="output-torch"
+    checkpoint_root="checkpoints-torch"
   />
 
   <strategy start_ds="20200101" end_ds="20240631" />
@@ -14,11 +14,11 @@
     />
 
     <runtime
-      snaptime="example_lgbm"
+      snaptime="example_torch"
       livetrading="false"
       trainDelay="1"
       retDays="1"
-      tsDays="3"
+      tsDays="8"
       model_smooth_rate="0.7"
       model_keep_num="0"
       select_days="100"
@@ -27,9 +27,9 @@
 
     <model
       device="cpu"
-      hiddenSize="16"
-      lr="0.05"
-      epochs="100"
+      hiddenSize="64"
+      lr="0.001"
+      epochs="5"
       num_leaves="31"
       feature_fraction="0.8"
       bagging_fraction="0.8"
