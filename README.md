@@ -1,30 +1,21 @@
 # comb2-organize
 
-`comb2-organize` 用来把 research 模型接到 `comb2` 和 `comb2-pcmaster` 上，完成训练、信号生成和回测。
+`comb2-organize` 用来把 research 模型接到内置的 `comb2` 和 `comb2-pcmaster` 源码上，完成训练、信号生成和回测。
 
-## 准备依赖仓库
+## 安装方式
 
-先下载两个依赖仓库并安装：
+下载这个仓库即可。当前仓库已经临时内置所需源码：
 
-```bash
-git clone git@10.20.4.19:factorsimteam/combo/comb2.git
-git clone git@10.20.4.19:factorsimteam/combo/comb2_pcmaster.git
+```text
+vendor/
+  comb2/
+    comb2/
+    src/
+  comb2-pcmaster/
+    comb2_pcmaster/
 ```
 
-### 编译并安装 `comb2`
-
-```bash
-cd comb2
-python3 setup.py build_ext --inplace
-python3 -m pip install .
-```
-
-### 安装 `comb2-pcmaster`
-
-```bash
-cd ../comb2_pcmaster
-python3 -m pip install .
-```
+`vendor/` 只包含运行所需源码，不包含原仓库 git history、构建产物、缓存和历史输出。
 
 ## research 流程示例
 
@@ -57,13 +48,6 @@ comb2-example-lgbm/
 - `save(path_or_buffer)`
 - `load(path_or_buffer)`
 
-示例命令：
-
-```bash
-cd /root/autodl-tmp/comb2-example-lgbm
-ls
-```
-
 ### 3. 编写配置文件
 
 可以参考 `comb2-example-lgbm/config.xml`。
@@ -82,18 +66,19 @@ ls
 
 ### 4. 运行 organize 入口
 
-在 `comb2-organize` 目录下执行：
+可以从任意目录执行：
 
 ```bash
-cd /root/autodl-tmp/comb2-organize
-python3 runCombo.py /root/autodl-tmp/comb2-example-lgbm/config.xml
+python3 /root/autodl-tmp/comb2-organize/runCombo.py /root/autodl-tmp/comb2-example-lgbm/config.xml
 ```
 
 或者：
 
 ```bash
-python3 runCombo.py --config /root/autodl-tmp/comb2-example-lgbm/config.xml
+python3 /root/autodl-tmp/comb2-organize/runCombo.py --config /root/autodl-tmp/comb2-example-lgbm/config.xml
 ```
+
+研究员只需要把命令里的 `runCombo.py` 和 `config.xml` 换成自己的实际路径。
 
 ## 运行结果
 
@@ -109,3 +94,5 @@ python3 runCombo.py --config /root/autodl-tmp/comb2-example-lgbm/config.xml
 - `runCombo.py`：research 运行入口，负责加载配置、调用 `comb2`、再接入 `comb2-pcmaster` 回测
 - `config.py`：配置解析与默认参数
 - `alpha_strategy.py`：把信号转换为回测仓位
+- `vendor/comb2`：临时内置的 `comb2` 源码
+- `vendor/comb2-pcmaster`：临时内置的 `comb2-pcmaster` 源码

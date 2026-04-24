@@ -2,16 +2,26 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
+import os
+import sys
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import torch
 
+ORGANIZE_ROOT = Path(__file__).resolve().parent
+VENDOR_ROOT = ORGANIZE_ROOT / "vendor"
+for local_package_root in (VENDOR_ROOT / "comb2", VENDOR_ROOT / "comb2-pcmaster"):
+    local_package_path = str(local_package_root)
+    if local_package_path not in sys.path:
+        sys.path.insert(0, local_package_path)
+
 from comb2 import ComboBase, LoaderConfig
 from comb2_pcmaster import BacktestNode, DailyBacktest
-from factorsim import IndexMask
+from factorsim import IndexMask, Memmaper2, fast, operator
+from factorsim.config import NAN_DTYPE
 
-ORGANIZE_ROOT = Path(__file__).resolve().parent
 organize_config_spec = importlib.util.spec_from_file_location("comb2_organize_config", ORGANIZE_ROOT / "config.py")
 organize_config_module = importlib.util.module_from_spec(organize_config_spec)
 assert organize_config_spec.loader is not None
@@ -32,7 +42,7 @@ class Node:
 
 
 def print_daily_metrics(metrics: dict):
-    
+
     columns = [
         ("date", str(metrics["date"]), 10),
         ("pnl", f"{metrics['pnl']:.2f}", 14),
@@ -47,6 +57,86 @@ def print_daily_metrics(metrics: dict):
     print("[BACKTEST]")
     print(header)
     print(row)
+
+
+def safe_to_numpy(data):
+    if isinstance(data, torch.Tensor):
+        return data.cpu().numpy()
+    if isinstance(data, (list, tuple)):
+        return np.array(data)
+    return data
+
+
+def process_label(y, start_ds: int, end_ds: int, ashare_data_path: str):
+    y = fast.purify(y)
+    y = operator.baseUniMask(y, start_ds=start_ds, end_ds=end_ds, path=ashare_data_path, shift_n=-1)
+    y = operator.trdMask(y, start_ds=start_ds, end_ds=end_ds, path=ashare_data_path, shift_n=-1)
+    return y
+
+
+def get_backtest_label(ashare_data_path: str, period: str, start_ds: int, end_ds: int):
+    label = Memmaper2(f"{ashare_data_path}/1d_DailyLabel/DailyLabel.vwap30_label{period}").load(
+        start_ds=start_ds,
+        end_ds=end_ds,
+        df_type=True,
+    ).dloc[:]
+    label[np.isnan(label)] = NAN_DTYPE
+    return label
+
+
+def calculate_alpha_ic(alpha: pd.DataFrame, ashare_data_path: str) -> pd.DataFrame:
+    if alpha.index.nlevels > 1:
+        alpha = alpha.reset_index("times", drop=True).sort_index()
+    date_idx = alpha.index.astype(int)
+    end_time = min(int(date_idx[-1]), 20240101)
+    date_idx = date_idx[date_idx < end_time]
+    start_time = int(date_idx[0])
+    end_time = int(date_idx[-1])
+    alpha = alpha.reindex(index=date_idx)
+    x = alpha.values
+
+    label_1d = get_backtest_label(ashare_data_path, "1d", start_time, end_time).reindex(index=date_idx).values
+    label_5d = get_backtest_label(ashare_data_path, "5d", start_time, end_time).reindex(index=date_idx).values
+
+    x_masked = process_label(torch.tensor(x), start_time, end_time, ashare_data_path).numpy()
+    label_1d_masked = process_label(torch.tensor(label_1d), start_time, end_time, ashare_data_path).numpy()
+    label_5d_masked = process_label(torch.tensor(label_5d), start_time, end_time, ashare_data_path).numpy()
+
+    ic_1d = safe_to_numpy(fast.corr(x_masked, label_1d_masked, dim=-1, keepdims=True))
+    ic_perc = safe_to_numpy(fast.corr(fast.perc_long(x_masked), fast.rank(label_1d_masked, dim=-1), dim=-1, keepdims=True))
+    ic_rank = safe_to_numpy(fast.corr(fast.rank(x_masked, dim=-1), fast.rank(label_1d_masked, dim=-1), dim=-1, keepdims=True))
+    ic_5d = safe_to_numpy(fast.corr(x_masked, label_5d_masked, dim=-1, keepdims=True))
+    x_cov = (~np.isnan(x_masked) & ~np.isnan(label_1d_masked)).sum(axis=1).astype(float)
+    label_cov = (~np.isnan(label_1d_masked)).sum(axis=1).astype(float)
+    label_cov[label_cov == 0] = np.nan
+    coverage = x_cov / label_cov
+    daily_ic = np.concatenate([ic_1d, ic_5d, ic_rank, ic_perc, coverage[:, np.newaxis]], axis=-1)
+    return pd.DataFrame(daily_ic, index=date_idx, columns=["ic", "5dic", "rankic", "percic", "coverage"])
+
+
+def dump_alpha_analysis(node: Node, combo_config: dict):
+    if not node.alpha_history:
+        return
+    output_dir = Path(combo_config["paths"]["output_dir"])
+    output_dir.mkdir(parents=True, exist_ok=True)
+    alpha_history_path = Path(combo_config["output"]["alpha_history_path"])
+    alpha_history_path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(node.alpha_history, alpha_history_path)
+
+    codes = pd.Index([str(code).zfill(6) for code in IndexMask().code])
+    alpha = pd.DataFrame(
+        {date: value.detach().cpu().to(torch.float32).numpy() for date, value in node.alpha_history.items()},
+        index=codes,
+    ).T.sort_index()
+    alpha.index = alpha.index.astype(int)
+    alpha_path = output_dir / "alpha.parquet"
+    alpha.to_parquet(alpha_path)
+
+    ashare_data_path = os.path.dirname(os.path.dirname(combo_config["loader"]["label_path"]))
+    daily_ic = calculate_alpha_ic(alpha, ashare_data_path)
+    daily_ic_path = output_dir / "daily_ic"
+    daily_ic.to_csv(daily_ic_path, sep="\t", na_rep="NAN")
+    print(f"[IC] alpha={alpha_path} daily_ic={daily_ic_path}")
 
 
 def build_strategy_file() -> Path:
@@ -101,6 +191,7 @@ def main():
         print_daily_metrics(metrics)
 
     backtest.finalize()
+    dump_alpha_analysis(node, combo_config)
 
 
 if __name__ == "__main__":

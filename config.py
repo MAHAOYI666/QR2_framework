@@ -7,10 +7,17 @@ import xml.etree.ElementTree as ET
 import torch
 
 ORGANIZE_ROOT = Path(__file__).resolve().parent
-COMB2_ROOT = ORGANIZE_ROOT.parent / "comb2"
-PCM_ROOT = ORGANIZE_ROOT.parent / "comb2-pcmaster"
+VENDOR_ROOT = ORGANIZE_ROOT / "vendor"
+COMB2_ROOT = VENDOR_ROOT / "comb2"
+PCM_ROOT = VENDOR_ROOT / "comb2-pcmaster"
 
 DEFAULT_CONFIG = {
+    "constants": {
+        "cache_path": "/home/shared/data1/factorsim_data/Cache",
+        "factor_root": "/home/shared/data1/factorsim_data/Factor/FactorData",
+        "output_root": str(COMB2_ROOT / "output"),
+        "checkpoint_root": None,
+    },
     "strategy": {
         "start_ds": 20160111,
         "end_ds": 20200101,
@@ -66,6 +73,7 @@ DEFAULT_CONFIG = {
             "data_start_ds": 20160101,
             "valid_path": "/home/shared/data1/factorsim_data/Cache/AshareCache/Ashare",
             "filtered_path": "/home/shared/data1/factorsim_data/Cache/AshareCache/AshareFiltered",
+            "base_universe_path": "/home/shared/data1/factorsim_data/Cache/AshareCache/1d_StockMask2/StockMask2.BaseUnivMask",
         },
         "defaults": {
             "selection_module": None,
@@ -90,6 +98,10 @@ DTYPE_MAP = {
 }
 
 PATH_FIELDS = {
+    ("constants", "cache_path"),
+    ("constants", "factor_root"),
+    ("constants", "output_root"),
+    ("constants", "checkpoint_root"),
     ("combo", "paths", "base_dir"),
     ("combo", "paths", "output_dir"),
     ("combo", "paths", "model_path"),
@@ -99,6 +111,7 @@ PATH_FIELDS = {
     ("combo", "loader", "label_path"),
     ("combo", "loader", "valid_path"),
     ("combo", "loader", "filtered_path"),
+    ("combo", "loader", "base_universe_path"),
     ("backtest", "output_path"),
 }
 
@@ -181,8 +194,33 @@ def _resolve_path(value: str | None) -> str | None:
     return str(Path(value).expanduser().resolve())
 
 
+def _resolve_factor_path(factor_root: str, path: str) -> str:
+    factor_path = Path(path).expanduser()
+    if not factor_path.is_absolute():
+        factor_path = Path(factor_root) / factor_path
+    return str(factor_path.resolve())
+
+
+def _apply_constant_paths(config: dict) -> dict:
+    updated = deepcopy(config)
+    constants = updated["constants"]
+    cache_path = Path(constants["cache_path"]) / "AshareCache"
+    output_root = Path(constants["output_root"])
+
+    updated["combo"]["paths"]["output_dir"] = str(output_root)
+    updated["combo"]["paths"]["checkpoint_root"] = constants["checkpoint_root"]
+    updated["combo"]["output"]["alpha_history_path"] = str(output_root / "alpha_history.pt")
+    updated["combo"]["output"]["log_path"] = str(output_root / "train.log")
+    updated["combo"]["loader"]["label_path"] = str(cache_path / "1d_DailyLabel" / "DailyLabel.label1d")
+    updated["combo"]["loader"]["valid_path"] = str(cache_path / "Ashare")
+    updated["combo"]["loader"]["filtered_path"] = str(cache_path / "AshareFiltered")
+    updated["combo"]["loader"]["base_universe_path"] = str(cache_path / "1d_StockMask2" / "StockMask2.BaseUnivMask")
+    updated["backtest"]["output_path"] = str(output_root / "backtest")
+    return updated
+
+
 def _resolve_loaded_paths(config: dict) -> dict:
-    resolved = deepcopy(config)
+    resolved = _apply_constant_paths(config)
     for path_key in PATH_FIELDS:
         section = resolved
         for key in path_key[:-1]:
@@ -193,7 +231,8 @@ def _resolve_loaded_paths(config: dict) -> dict:
 
     factor_paths = resolved["combo"]["loader"].get("factor_paths")
     if factor_paths is not None:
-        resolved["combo"]["loader"]["factor_paths"] = tuple(_resolve_path(path) for path in factor_paths)
+        factor_root = str(Path(resolved["constants"]["factor_root"]) / "ZsimPool")
+        resolved["combo"]["loader"]["factor_paths"] = tuple(_resolve_factor_path(factor_root, path) for path in factor_paths)
     return resolved
 
 
@@ -202,6 +241,7 @@ def _load_xml_config(path: str) -> dict:
     if root.tag != "config":
         raise ValueError("xml config root tag must be <config>")
 
+    constants = _parse_section_attributes(root.find("constants"), DEFAULT_CONFIG["constants"])
     strategy = _parse_section_attributes(root.find("strategy"), DEFAULT_CONFIG["strategy"])
 
     combo_element = root.find("combo")
@@ -222,6 +262,7 @@ def _load_xml_config(path: str) -> dict:
     backtest = _parse_section_attributes(root.find("backtest"), DEFAULT_CONFIG["backtest"])
 
     return {
+        "constants": constants,
         "strategy": strategy,
         "combo": combo,
         "backtest": backtest,
