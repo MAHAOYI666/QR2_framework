@@ -92,9 +92,13 @@ class ResearchModel:
         self.hidden_size = int(config.get("hidden_size", 64))
         self.fc_size = int(config.get("fc_size", self.hidden_size))
         self.dropout = float(config.get("dropout", 0.5))
-        self.lr = float(config.get("lr", 1e-3))
-        self.epochs = int(config.get("epochs", 1))
-        self.batch_size = int(config.get("batch_size", 4))
+        self.lr = float(config.get("lr", 2e-6))
+        self.epochs = int(config.get("epochs", 15))
+        self.batch_size = int(config.get("batch_size", 3))
+        self.weight_decay = float(config.get("weight_decay", 1e-6))
+        self.scheduler_step_size = int(config.get("scheduler_step_size", 10))
+        self.scheduler_gamma = float(config.get("scheduler_gamma", 0.5))
+        self.grad_clip = float(config.get("grad_clip", 10.0))
         self.trainii: torch.Tensor | None = None
         self.model: Model | None = None
         self.loss_fn = TrainLoss()
@@ -113,7 +117,12 @@ class ResearchModel:
     def fit(self, dataset):
         self.trainii = dataset.validinsts.detach().cpu().to(torch.long).clone()
         self.model = self._init_model(self.trainii)
-        optimizer = torch.optim.AdamW(self.model.parameters(), lr=self.lr)
+        optimizer = torch.optim.Adam(self.model.parameters(), lr=self.lr, weight_decay=self.weight_decay)
+        scheduler = torch.optim.lr_scheduler.StepLR(
+            optimizer=optimizer,
+            step_size=self.scheduler_step_size,
+            gamma=self.scheduler_gamma,
+        )
         dataloader = DataLoader(dataset, batch_size=self.batch_size, shuffle=True)
         self.model.train()
 
@@ -128,9 +137,11 @@ class ResearchModel:
                 pred = self.model(x)
                 loss = self.loss_fn(pred, y, w)
                 loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
                 optimizer.step()
                 total_loss += float(loss.detach().cpu())
                 batches += 1
+            scheduler.step()
             print(f"[FIT] epoch={epoch + 1}/{self.epochs} loss={total_loss / max(batches, 1):.6f}")
         return self
 
