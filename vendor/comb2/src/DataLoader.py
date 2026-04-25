@@ -144,11 +144,11 @@ class ComboDataLoader:
     def gen_label(self, ds: int, ret_days: int = 1) -> tuple[torch.Tensor, torch.Tensor]:
         ds = self.align_date(ds)
         end_didx = self.date2didx(ds)
-        start_didx = end_didx - ret_days
+        start_didx = end_didx - ret_days + 1
         if start_didx < self.data_start_didx:
             raise ValueError(f"not enough label history for ds={ds}, ret_days={ret_days}")
 
-        dates = [self.didx2date(didx) for didx in range(start_didx + 1, end_didx + 1)]
+        dates = [self.didx2date(didx) for didx in range(start_didx, end_didx + 1)]
         returns = [self.label_source.load_day(cur_ds).to(torch.float32) for cur_ds in dates]
         cret = torch.stack(returns, dim=0)
         cret = nan_to_num(cret, 0.0)
@@ -201,7 +201,7 @@ class ComboTrainDataset(Dataset):
         self.step_size = int(step_size)
         self.feat_size = loader.num_features
         self.end_didx = loader.date2didx(self.end_ds)
-        self.start_didx = max(loader.data_start_didx + self.step_size - 1, self.end_didx - self.ndays + 1)
+        self.start_didx = max(loader.data_start_didx + self.x_delay - 1, self.end_didx - self.ndays + 1)
         self.ndays = self.end_didx - self.start_didx + 1
 
         instsz = len(MASK.code)
@@ -219,8 +219,10 @@ class ComboTrainDataset(Dataset):
 
         for offset in range(self.ndays):
             label_didx = self.start_didx + offset
+            feature_didx = label_didx - self.x_delay + 1
             label_ds = loader.didx2date(label_didx)
-            x = loader.gen_feature(label_ds)
+            feature_ds = loader.didx2date(feature_didx)
+            x = loader.gen_feature(feature_ds)
             y, w = loader.gen_label(label_ds, ret_days=self.x_delay)
             self.X[offset] = torch.nan_to_num(x[self.validinsts], nan=0.0)
             self.Y[offset] = torch.nan_to_num(y[self.validinsts], nan=0.0)
@@ -229,7 +231,7 @@ class ComboTrainDataset(Dataset):
     def _build_validinsts(self) -> torch.Tensor:
         masks = []
         for didx in range(self.start_didx, self.end_didx + 1):
-            ds = self.loader.didx2date(didx)
+            ds = self.loader.didx2date(didx - self.x_delay + 1)
             masks.append(self.loader.gen_base_universe_mask(ds))
         stacked = torch.stack(masks, dim=0)
         return torch.where(stacked.any(dim=0))[0]
