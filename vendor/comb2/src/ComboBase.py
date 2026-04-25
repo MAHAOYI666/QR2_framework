@@ -338,7 +338,7 @@ class ComboBase:
         return model_date_to_use
 
     def SaveCheckpointModel(self, save_dir: str, dt: int):
-        if self.model is None or not save_dir:
+        if self.model is None or not save_dir or self.model_keep_num == 0:
             return
         dt_dir = os.path.join(save_dir, str(dt))
         os.makedirs(dt_dir, exist_ok=True)
@@ -349,7 +349,9 @@ class ComboBase:
         self.diskclean(self.model_keep_num)
 
     def diskclean(self, keep_num: int = 4):
-        if keep_num <= 0:
+        if keep_num < 0:
+            return
+        if keep_num == 0:
             return
         if not self.modelDir or not os.path.exists(self.modelDir):
             return
