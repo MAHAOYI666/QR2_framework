@@ -77,6 +77,14 @@ DEFAULT_CONFIG = {
         "verbose": False,
         "universe": "base",
     },
+    "monitor": {
+        "enabled": False,
+        "output_path": None,
+        "format": "csv",
+        "print_summary": True,
+        "collect_gpu": True,
+        "sync_cuda": False,
+    },
 }
 
 DTYPE_MAP = {
@@ -103,6 +111,7 @@ PATH_FIELDS = {
     ("combo", "loader", "filtered_path"),
     ("combo", "loader", "base_universe_path"),
     ("backtest", "output_path"),
+    ("monitor", "output_path"),
 }
 
 
@@ -272,12 +281,14 @@ def _load_xml_config(path: str) -> dict:
             combo["loader"]["factor_paths"] = factor_paths
 
     backtest = _parse_section_attributes(root.find("backtest"), DEFAULT_CONFIG["backtest"])
+    monitor = _parse_section_attributes(root.find("monitor"), DEFAULT_CONFIG["monitor"])
 
     return {
         "constants": constants,
         "strategy": strategy,
         "combo": combo,
         "backtest": backtest,
+        "monitor": monitor,
     }
 
 

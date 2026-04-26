@@ -107,6 +107,16 @@ python3 /path/to/comb2-organize/runCombo.py --config /path/to/research/config.xm
 - `output/backtest/daily_pnl.csv`
 - `checkpoints/` 下的模型文件
 
+## 性能监控
+
+性能监控默认关闭，不影响原有训练和回测流程。需要时可在 XML 顶层加入：
+
+```xml
+<monitor enabled="true" output_path="output/perf_metrics.csv" collect_gpu="true" sync_cuda="false" />
+```
+
+启用后会记录 `setup`、`combine`、`alpha_convert`、`backtest_step`、`backtest_finalize`、`alpha_analysis` 以及可选的 `combo_*` 阶段，包含耗时、CPU 进程内存和可用的 PyTorch CUDA 显存信息。默认不做 CUDA synchronize，避免明显改变运行时序。
+
 ## 当前目录说明
 
 - `runCombo.py`：research 运行入口，负责加载配置、调用 `comb2`、再接入 `comb2-pcmaster` 回测
@@ -114,3 +124,4 @@ python3 /path/to/comb2-organize/runCombo.py --config /path/to/research/config.xm
 - `alpha_strategy.py`：把信号转换为回测仓位
 - `vendor/comb2`：临时内置的 `comb2` 源码
 - `vendor/comb2-pcmaster`：临时内置的 `comb2-pcmaster` 源码
+- `vendor/perf_monitor.py`：可选性能监控模块

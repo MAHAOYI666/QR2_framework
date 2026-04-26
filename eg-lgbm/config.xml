@@ -153,4 +153,11 @@
     verbose="false"
     universe="base"
   />
+
+  <monitor
+    enabled="true"
+    output_path="output/perf_metrics.csv"
+    collect_gpu="true"
+    sync_cuda="false"
+  />
 </config>

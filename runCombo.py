@@ -21,6 +21,7 @@ from comb2 import ComboBase, LoaderConfig
 from comb2_pcmaster import BacktestNode, DailyBacktest
 from factorsim import IndexMask, Memmaper2, fast, operator
 from factorsim.config import NAN_DTYPE
+from vendor.perf_monitor import PerfMonitor
 
 organize_config_spec = importlib.util.spec_from_file_location("comb2_organize_config", ORGANIZE_ROOT / "config.py")
 organize_config_module = importlib.util.module_from_spec(organize_config_spec)
@@ -177,24 +178,36 @@ def main():
     args = parse_args()
     config_path = args.config_flag or args.config
     organize_config = organize_config_module.load_config(config_path)
-    combo_config = organize_config["combo"]
+    monitor = PerfMonitor.from_config(organize_config)
+    try:
+        combo_config = organize_config["combo"]
 
-    node = Node(combo_config)
-    combo = ComboBase(node)
-    codes = pd.Index([str(code).zfill(6) for code in IndexMask().code])
+        with monitor.section("setup"):
+            node = Node(combo_config)
+            node.monitor = monitor
+            combo = ComboBase(node)
+            codes = pd.Index([str(code).zfill(6) for code in IndexMask().code])
 
-    strategy_path = build_strategy_file()
-    backtest_node = build_backtest_node(strategy_path, organize_config)
-    backtest = DailyBacktest(backtest_node)
+            strategy_path = build_strategy_file()
+            backtest_node = build_backtest_node(strategy_path, organize_config)
+            backtest = DailyBacktest(backtest_node)
 
-    for date in sorted(backtest.vwap_data.index):
-        combo.Combine(int(date))
-        alpha = node.alpha.detach().cpu().to(dtype=node.alpha.dtype).numpy()
-        metrics = backtest.step(int(date), pd.Series(alpha, index=codes))
-        print_daily_metrics(metrics)
+        for date in sorted(backtest.vwap_data.index):
+            date_int = int(date)
+            with monitor.section("combine", date=date_int):
+                combo.Combine(date_int)
+            with monitor.section("alpha_convert", date=date_int):
+                alpha = node.alpha.detach().cpu().to(dtype=node.alpha.dtype).numpy()
+            with monitor.section("backtest_step", date=date_int):
+                metrics = backtest.step(date_int, pd.Series(alpha, index=codes))
+            print_daily_metrics(metrics)
 
-    backtest.finalize()
-    dump_alpha_analysis(node, combo_config)
+        with monitor.section("backtest_finalize"):
+            backtest.finalize()
+        with monitor.section("alpha_analysis"):
+            dump_alpha_analysis(node, combo_config)
+    finally:
+        monitor.close()
 
 
 if __name__ == "__main__":
