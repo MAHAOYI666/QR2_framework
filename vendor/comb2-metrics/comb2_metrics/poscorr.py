@@ -9,16 +9,20 @@ import pandas as pd
 def pos_corr(
     pos1_path: str | Path,
     pos2_path: str | Path,
-    start: int,
-    end: int,
+    start: int | None = None,
+    end: int | None = None,
     *,
     min_valid: int = 1000,
 ) -> pd.Series:
     pos1 = pd.read_parquet(pos1_path)
     pos2 = pd.read_parquet(pos2_path)
 
-    pos1 = pos1.loc[(pos1.index >= start) & (pos1.index < end)]
-    pos2 = pos2.loc[(pos2.index >= start) & (pos2.index < end)]
+    if start is not None:
+        pos1 = pos1.loc[pos1.index >= start]
+        pos2 = pos2.loc[pos2.index >= start]
+    if end is not None:
+        pos1 = pos1.loc[pos1.index < end]
+        pos2 = pos2.loc[pos2.index < end]
 
     common_index = pos1.index.intersection(pos2.index)
     pos1 = pos1.loc[common_index]
