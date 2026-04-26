@@ -33,9 +33,10 @@ organize_config_spec.loader.exec_module(organize_config_module)
 
 
 class AblationCombo(ComboBase):
-    def __init__(self, node, features: list[int] | None = None, train_enabled: bool = False):
+    def __init__(self, node, features: list[int] | None = None, train_enabled: bool = False, batch_size: int = 16):
         super().__init__(node)
         self.train_enabled = train_enabled
+        self.ablation_batch_size = max(1, int(batch_size))
         feature_count = self.loader.num_features
         selected_features = list(range(feature_count)) if features is None else features
         for feature_idx in selected_features:
@@ -85,6 +86,41 @@ class AblationCombo(ComboBase):
         alpha[~valid_mask] = torch.nan
         return alpha
 
+    def _can_predict_batch(self, model) -> bool:
+        return bool(hasattr(model, "model") and getattr(model, "model") is not None and self._model_trainii(model) is not None)
+
+    @torch.no_grad()
+    def _predict_batch_with_refill(self, model, windows: torch.Tensor) -> torch.Tensor:
+        if not self._can_predict_batch(model):
+            return torch.stack([self._predict_with_refill(model, window) for window in windows], dim=0)
+        trainii = self._model_trainii(model)
+        assert trainii is not None
+        model.model.eval()
+        x = windows[:, :, trainii].to(model.device, dtype=torch.float32)
+        pred = model.model(x).detach().cpu().to(dtype=self.loader.dtype)
+        full_pred = torch.full((windows.shape[0], len(self.loader.mask.code)), torch.nan, dtype=self.loader.dtype)
+        full_pred[:, trainii] = pred
+        return full_pred
+
+    def _store_feature_batch(self, feature_window: torch.Tensor, valid_mask: torch.Tensor, items: list[tuple[str, int | None]]):
+        if not items:
+            return
+        windows = []
+        for _, feature_idx in items:
+            window = feature_window if feature_idx is None else feature_window.clone()
+            if feature_idx is not None:
+                window[:, :, feature_idx] = 0
+            windows.append(window)
+        batch = torch.stack(windows, dim=0)
+        pred = self._predict_batch_with_refill(self.model, batch)
+        if self.oldModel is not None:
+            old_pred = self._predict_batch_with_refill(self.oldModel, batch)
+            pred = pred * self.model_smooth_rate + old_pred * (1 - self.model_smooth_rate)
+        pred = pred.to(self.loader.dtype)
+        pred[:, ~valid_mask] = torch.nan
+        for row, (name, _) in enumerate(items):
+            self._store_variant_alpha(name, self.current_gen_ds, pred[row])
+
     def GenComboPos(self, ds: int):
         self.variant_alphas = {}
         if self.model is None:
@@ -106,17 +142,14 @@ class AblationCombo(ComboBase):
         feature_window = nan_to_num(self.buffer.get(didx_list), 0.0).to(self.loader.dtype)
         valid_mask = self.loader.gen_valid_mask(ds)
 
-        baseline_alpha = self._predict_alpha(feature_window, valid_mask)
+        self.current_gen_ds = ds
+        items = list(self.variant_features.items())
+        for start in range(0, len(items), self.ablation_batch_size):
+            self._store_feature_batch(feature_window, valid_mask, items[start : start + self.ablation_batch_size])
+
+        baseline_alpha = self.variant_alphas["baseline"]
         self.node.alpha[:] = baseline_alpha
         self._record_alpha(ds)
-        self._store_variant_alpha("baseline", ds, baseline_alpha)
-
-        for name, feature_idx in self.variant_features.items():
-            if feature_idx is None:
-                continue
-            ablated_window = feature_window.clone()
-            ablated_window[:, :, feature_idx] = 0
-            self._store_variant_alpha(name, ds, self._predict_alpha(ablated_window, valid_mask))
 
         self._log_alpha(ds, "predict")
         return self.node.alpha
@@ -134,6 +167,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--config", dest="config_flag", type=str, default=None, help="Path to XML experiment config")
     parser.add_argument("--features", type=str, default=None, help="Comma-separated feature indices to ablate")
     parser.add_argument("--output-suffix", default="ablation_by_zero", help="Subdirectory under combo output_dir for ablation outputs")
+    parser.add_argument("--ablation-batch-size", type=int, default=16, help="Number of baseline/feature variants to predict per forward batch")
     parser.add_argument("--train", action="store_true", help="Allow training and checkpoint saving during the ablation run")
     return parser.parse_args()
 
@@ -160,7 +194,12 @@ def main():
         with monitor.section("setup"):
             node = Node(combo_config)
             node.monitor = monitor
-            combo = AblationCombo(node, features=parse_features(args.features), train_enabled=args.train)
+            combo = AblationCombo(
+                node,
+                features=parse_features(args.features),
+                train_enabled=args.train,
+                batch_size=args.ablation_batch_size,
+            )
             codes = pd.Index([str(code).zfill(6) for code in IndexMask().code])
 
             base_output_dir = Path(combo_config["paths"]["output_dir"])
