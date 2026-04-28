@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from dataclasses import dataclass
 import os
 from typing import Iterable, Protocol, Sequence
@@ -14,6 +15,12 @@ from torch.utils.data import Dataset
 from .op_utils import cs_zscore, nan_to_num, nanmedian, nanstd, normalize_by_max_abs, to_bool_mask, truncate, winsorize_by_quantile
 
 MASK = IndexMask()
+
+
+def _maybe_section(monitor, event: str, ds: int | None = None, *, level: str = "full"):
+    if monitor is None:
+        return nullcontext()
+    return monitor.maybe_section(event, date=ds, level=level)
 
 
 class FeatureSource(Protocol):
@@ -36,11 +43,14 @@ class MemmapFeatureSource:
         return self._cache[path]
 
     def load_day(self, ds: int) -> torch.Tensor:
+        monitor = getattr(self, "monitor", None)
         values = []
-        for path in self.paths:
-            data = self._mmap(path).load(start_ds=int(ds), end_ds=int(ds))[:]
-            values.append(torch.as_tensor(np.asarray(data)[0], dtype=self.dtype))
-        return torch.stack(values, dim=-1)
+        with _maybe_section(monitor, "mmap_feature.load", int(ds), level="full"):
+            for path in self.paths:
+                data = self._mmap(path).load(start_ds=int(ds), end_ds=int(ds))[:]
+                values.append(torch.as_tensor(np.asarray(data)[0], dtype=self.dtype))
+        with _maybe_section(monitor, "mmap_feature.stack", int(ds), level="full"):
+            return torch.stack(values, dim=-1)
 
 
 class EmptyCubeSource:
@@ -59,9 +69,11 @@ class MemmapLabelSource:
         self._mmap = Memmaper2(path)
 
     def load_day(self, ds: int) -> torch.Tensor:
-        data = self._mmap.load(start_ds=int(ds), end_ds=int(ds))[:]
-        label = torch.as_tensor(np.asarray(data)[0], dtype=self.dtype)
-        return label
+        monitor = getattr(self, "monitor", None)
+        with _maybe_section(monitor, "mmap_label.load", int(ds), level="full"):
+            data = self._mmap.load(start_ds=int(ds), end_ds=int(ds))[:]
+            label = torch.as_tensor(np.asarray(data)[0], dtype=self.dtype)
+            return label
 
 
 class MemmapMaskSource:
@@ -74,9 +86,11 @@ class MemmapMaskSource:
     def load_day(self, ds: int) -> torch.Tensor:
         if self._mmap is None:
             return torch.ones(len(MASK.code), dtype=torch.bool)
-        data = self._mmap.load(start_ds=int(ds), end_ds=int(ds))[:]
-        mask = torch.as_tensor(np.asarray(data)[0])
-        return to_bool_mask(mask)
+        monitor = getattr(self, "monitor", None)
+        with _maybe_section(monitor, "mmap_mask.load", int(ds), level="full"):
+            data = self._mmap.load(start_ds=int(ds), end_ds=int(ds))[:]
+            mask = torch.as_tensor(np.asarray(data)[0])
+            return to_bool_mask(mask)
 
 
 @dataclass
@@ -103,7 +117,15 @@ class ComboDataLoader:
         self.valid_source = MemmapMaskSource(self.config.valid_path)
         self.filtered_source = MemmapMaskSource(self.config.filtered_path)
         self.base_universe_source = MemmapMaskSource(self.config.base_universe_path)
+        self.monitor = None
         self.num_features = self.factor_source.feature_dim + self.cube_source.feature_dim
+
+    def _sync_monitor_refs(self):
+        self.factor_source.monitor = self.monitor
+        self.label_source.monitor = self.monitor
+        self.valid_source.monitor = self.monitor
+        self.filtered_source.monitor = self.monitor
+        self.base_universe_source.monitor = self.monitor
 
     def date2didx(self, ds: int) -> int:
         didx = int(self.mask.date2didx(int(ds)))
@@ -119,16 +141,21 @@ class ComboDataLoader:
 
     def gen_feature(self, ds: int) -> torch.Tensor:
         ds = self.align_date(ds)
-        factor = self.factor_source.load_day(ds).to(torch.float32)
-        cube = self.cube_source.load_day(ds).to(torch.float32)
+        self._sync_monitor_refs()
+        with _maybe_section(self.monitor, "gen_feature.factor_load", ds, level="full"):
+            factor = self.factor_source.load_day(ds).to(torch.float32)
+        with _maybe_section(self.monitor, "gen_feature.cube_load", ds, level="full"):
+            cube = self.cube_source.load_day(ds).to(torch.float32)
         if cube.shape[1] == 0:
             feature = factor
         else:
             feature = torch.cat([factor, cube], dim=-1)
         feature[torch.isinf(feature)] = torch.nan
-        feature = cs_zscore(feature.transpose(0, 1)).transpose(0, 1)
-        feature = truncate(feature, -4.0, 4.0)
-        feature = nan_to_num(feature, 0.0)
+        with _maybe_section(self.monitor, "gen_feature.cs_zscore", ds, level="full"):
+            feature = cs_zscore(feature.transpose(0, 1)).transpose(0, 1)
+        with _maybe_section(self.monitor, "gen_feature.truncate_nan_to_num", ds, level="full"):
+            feature = truncate(feature, -4.0, 4.0)
+            feature = nan_to_num(feature, 0.0)
         return feature.to(self.dtype)
 
     def gen_base_universe_mask(self, ds: int) -> torch.Tensor:
@@ -149,14 +176,17 @@ class ComboDataLoader:
             raise ValueError(f"not enough label history for ds={ds}, ret_days={ret_days}")
 
         dates = [self.didx2date(didx) for didx in range(start_didx, end_didx + 1)]
-        returns = [self.label_source.load_day(cur_ds).to(torch.float32) for cur_ds in dates]
-        cret = torch.stack(returns, dim=0)
-        cret = nan_to_num(cret, 0.0)
-        decay_weights = torch.arange(ret_days, 0, -1, dtype=torch.float32, device=cret.device)
-        cret = torch.tensordot(decay_weights, cret, dims=([0], [0]))
-        cret[torch.isinf(cret)] = torch.nan
+        with _maybe_section(self.monitor, "gen_label.load_returns", ds, level="full"):
+            returns = [self.label_source.load_day(cur_ds).to(torch.float32) for cur_ds in dates]
+        with _maybe_section(self.monitor, "gen_label.aggregate", ds, level="full"):
+            cret = torch.stack(returns, dim=0)
+            cret = nan_to_num(cret, 0.0)
+            decay_weights = torch.arange(ret_days, 0, -1, dtype=torch.float32, device=cret.device)
+            cret = torch.tensordot(decay_weights, cret, dims=([0], [0]))
+            cret[torch.isinf(cret)] = torch.nan
 
-        valid_mask = self.gen_valid_mask(self.didx2date(start_didx)) & (~torch.isnan(cret))
+        with _maybe_section(self.monitor, "gen_label.valid_mask", ds, level="full"):
+            valid_mask = self.gen_valid_mask(self.didx2date(start_didx)) & (~torch.isnan(cret))
         valid_values = cret[valid_mask]
         if valid_values.numel() > 0:
             valid_values = winsorize_by_quantile(valid_values, 0.01, 0.99)
@@ -204,29 +234,55 @@ class ComboTrainDataset(Dataset):
         self.start_didx = max(loader.data_start_didx + self.x_delay - 1, self.end_didx - self.ndays + 1)
         self.ndays = self.end_didx - self.start_didx + 1
 
+        monitor = getattr(loader, "monitor", None)
         instsz = len(MASK.code)
-        if validinsts is None:
-            self.validinsts = self._build_validinsts()
-        else:
-            self.validinsts = validinsts.to(dtype=torch.long)
+        with _maybe_section(monitor, "dataset_init.build_validinsts", self.end_ds, level="full"):
+            if validinsts is None:
+                self.validinsts = self._build_validinsts()
+            else:
+                self.validinsts = validinsts.to(dtype=torch.long)
         self.numValidinsts = len(self.validinsts)
         if self.numValidinsts == 0:
             self.validinsts = torch.arange(instsz)
             self.numValidinsts = instsz
-        self.X = torch.zeros((self.ndays, self.numValidinsts, self.feat_size), dtype=loader.dtype)
-        self.Y = torch.zeros((self.ndays, self.numValidinsts), dtype=loader.dtype)
-        self.W = torch.zeros((self.ndays, self.numValidinsts), dtype=loader.dtype)
+        with _maybe_section(monitor, "dataset_init.alloc_xyw", self.end_ds, level="full"):
+            self.X = torch.zeros((self.ndays, self.numValidinsts, self.feat_size), dtype=loader.dtype)
+            self.Y = torch.zeros((self.ndays, self.numValidinsts), dtype=loader.dtype)
+            self.W = torch.zeros((self.ndays, self.numValidinsts), dtype=loader.dtype)
 
-        for offset in range(self.ndays):
-            label_didx = self.start_didx + offset
-            feature_didx = label_didx - self.x_delay + 1
-            label_ds = loader.didx2date(label_didx)
-            feature_ds = loader.didx2date(feature_didx)
-            x = loader.gen_feature(feature_ds)
-            y, w = loader.gen_label(label_ds, ret_days=self.x_delay)
-            self.X[offset] = torch.nan_to_num(x[self.validinsts], nan=0.0)
-            self.Y[offset] = torch.nan_to_num(y[self.validinsts], nan=0.0)
-            self.W[offset] = w[self.validinsts].to(loader.dtype)
+        loop_gen_feature = monitor.accumulator("dataset_init.loop.gen_feature", date=self.end_ds) if monitor else None
+        loop_gen_label = monitor.accumulator("dataset_init.loop.gen_label", date=self.end_ds) if monitor else None
+        loop_tensor_assign = monitor.accumulator("dataset_init.loop.tensor_assign", date=self.end_ds) if monitor else None
+        with _maybe_section(monitor, "dataset_init.loop_total", self.end_ds, level="full"):
+            for offset in range(self.ndays):
+                label_didx = self.start_didx + offset
+                feature_didx = label_didx - self.x_delay + 1
+                label_ds = loader.didx2date(label_didx)
+                feature_ds = loader.didx2date(feature_didx)
+                if loop_gen_feature is not None and monitor.detail_enabled("full"):
+                    with loop_gen_feature.tick():
+                        x = loader.gen_feature(feature_ds)
+                else:
+                    x = loader.gen_feature(feature_ds)
+                if loop_gen_label is not None and monitor.detail_enabled("full"):
+                    with loop_gen_label.tick():
+                        y, w = loader.gen_label(label_ds, ret_days=self.x_delay)
+                else:
+                    y, w = loader.gen_label(label_ds, ret_days=self.x_delay)
+                if loop_tensor_assign is not None and monitor.detail_enabled("full"):
+                    with loop_tensor_assign.tick():
+                        self.X[offset] = torch.nan_to_num(x[self.validinsts], nan=0.0)
+                        self.Y[offset] = torch.nan_to_num(y[self.validinsts], nan=0.0)
+                        self.W[offset] = w[self.validinsts].to(loader.dtype)
+                else:
+                    self.X[offset] = torch.nan_to_num(x[self.validinsts], nan=0.0)
+                    self.Y[offset] = torch.nan_to_num(y[self.validinsts], nan=0.0)
+                    self.W[offset] = w[self.validinsts].to(loader.dtype)
+
+        if loop_gen_feature is not None and monitor.detail_enabled("full"):
+            loop_gen_feature.flush()
+            loop_gen_label.flush()
+            loop_tensor_assign.flush()
 
     def _build_validinsts(self) -> torch.Tensor:
         masks = []

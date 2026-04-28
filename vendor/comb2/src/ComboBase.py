@@ -36,6 +36,7 @@ class ComboBase:
             os.makedirs(self.modelDir, exist_ok=True)
 
         self.loader = ComboDataLoader(node.loader_config)
+        self.loader.monitor = getattr(node, "monitor", None)
         self.buffer = ComboBuffer(feat_size=self.loader.num_features, keepdays=self.tsDays, instsz=len(self.loader.mask.code), dtype=self.loader.dtype)
         self.selection = node.selection_module or DefaultSelectionModule(
             max_train_days=self.max_train_days,
@@ -53,6 +54,12 @@ class ComboBase:
         if monitor is None:
             return nullcontext()
         return monitor.section(name, date=ds)
+
+    def _detail_section(self, name: str, ds: int | None = None, *, level: str = "full", kind: str = "cpu"):
+        monitor = getattr(self.node, "monitor", None)
+        if monitor is None:
+            return nullcontext()
+        return monitor.maybe_section(name, date=ds, level=level, kind=kind)
 
     def _model_config(self) -> dict[str, Any]:
         model_config = dict(getattr(self.node, "model_config", {}))
@@ -168,16 +175,19 @@ class ComboBase:
         return self.loader.didx2date(max(0, didx - offset))
 
     def buffer_load(self, ds: int):
-        end_didx = self.loader.date2didx(ds)
-        if self.reset_buffer:
-            loaddays = self.tsDays
-            self.reset_buffer = False
-        else:
-            loaddays = 1
-        for dd in range(loaddays):
-            didx = end_didx - dd
-            feature = self.loader.gen_feature(self.loader.didx2date(didx))
-            self.buffer.append(feature, didx)
+        with self._detail_section("buffer_load.total", ds, level="standard"):
+            end_didx = self.loader.date2didx(ds)
+            if self.reset_buffer:
+                loaddays = self.tsDays
+                self.reset_buffer = False
+            else:
+                loaddays = 1
+            with self._detail_section("buffer_load.gen_feature_total", ds, level="full"):
+                for dd in range(loaddays):
+                    didx = end_didx - dd
+                    feature = self.loader.gen_feature(self.loader.didx2date(didx))
+                    with self._detail_section("buffer_load.buffer_append", ds, level="full"):
+                        self.buffer.append(feature, didx)
 
     def _model_trainii(self, model) -> torch.Tensor | None:
         trainii = getattr(model, "trainii", None)
@@ -191,12 +201,16 @@ class ComboBase:
             pred = self.predict(model, feature_window)
             if pred.numel() == len(self.loader.mask.code):
                 return pred.to(dtype=self.loader.dtype)
-            full_pred = torch.full((len(self.loader.mask.code),), torch.nan, dtype=self.loader.dtype)
-            full_pred[:pred.numel()] = pred.to(dtype=self.loader.dtype)
+            with self._detail_section("predict.refill", level="full"):
+                full_pred = torch.full((len(self.loader.mask.code),), torch.nan, dtype=self.loader.dtype)
+                full_pred[:pred.numel()] = pred.to(dtype=self.loader.dtype)
             return full_pred
-        pred = self.predict(model, feature_window[:, trainii])
-        full_pred = torch.full((len(self.loader.mask.code),), torch.nan, dtype=self.loader.dtype)
-        full_pred[trainii] = pred.to(dtype=self.loader.dtype)
+        with self._detail_section("predict.feature_window_index", level="full"):
+            selected_feature = feature_window[:, trainii]
+        pred = self.predict(model, selected_feature)
+        with self._detail_section("predict.refill", level="full"):
+            full_pred = torch.full((len(self.loader.mask.code),), torch.nan, dtype=self.loader.dtype)
+            full_pred[trainii] = pred.to(dtype=self.loader.dtype)
         return full_pred
 
     def GenComboPos(self, ds: int):
@@ -214,61 +228,82 @@ class ComboBase:
         end_didx = self.loader.date2didx(ds)
         didx_list = [end_didx - (self.tsDays - 1) + i for i in range(self.tsDays)]
         feature_window = nan_to_num(self.buffer.get(didx_list), 0.0).to(self.loader.dtype)
-        cur_pred = self._predict_with_refill(self.model, feature_window)
+        with self._detail_section("gen_combo_pos.predict_new", ds, level="standard"):
+            cur_pred = self._predict_with_refill(self.model, feature_window)
         if self.oldModel is not None:
-            old_pred = self._predict_with_refill(self.oldModel, feature_window)
-            cur_pred = cur_pred * self.model_smooth_rate + old_pred * (1 - self.model_smooth_rate)
-        valid_mask = self.loader.gen_valid_mask(ds)
-        self.node.alpha[:] = cur_pred
-        self._set_invalid_alpha(valid_mask)
-        self._record_alpha(ds)
+            with self._detail_section("gen_combo_pos.predict_old", ds, level="full"):
+                old_pred = self._predict_with_refill(self.oldModel, feature_window)
+            with self._detail_section("gen_combo_pos.smooth", ds, level="full"):
+                cur_pred = cur_pred * self.model_smooth_rate + old_pred * (1 - self.model_smooth_rate)
+        with self._detail_section("gen_combo_pos.valid_mask", ds, level="full"):
+            valid_mask = self.loader.gen_valid_mask(ds)
+        with self._detail_section("gen_combo_pos.set_alpha", ds, level="standard"):
+            self.node.alpha[:] = cur_pred
+            self._set_invalid_alpha(valid_mask)
+            self._record_alpha(ds)
         self._log_alpha(ds, "predict")
         return self.node.alpha
 
     def predict(self, model, feature_window: torch.Tensor) -> torch.Tensor:
-        pred = model.predict(feature_window)
+        device = getattr(model, "device", None)
+        is_cuda_model = isinstance(device, torch.device) and device.type == "cuda" and torch.cuda.is_available()
+        if is_cuda_model:
+            # ResearchModel 内部自行处理 HtoD/Forward/DtoH，外层无法稳定拆分，仅记录 GPU 总耗时。
+            with self._detail_section("predict.gpu_total", level="full", kind="cuda"):
+                pred = model.predict(feature_window)
+        else:
+            with self._detail_section("predict.cpu_total", level="full"):
+                pred = model.predict(feature_window)
         if not isinstance(pred, torch.Tensor):
             pred = torch.as_tensor(pred, dtype=self.loader.dtype)
         return pred.to(dtype=self.loader.dtype)
 
     def Train(self, ds: int):
-        plan = self.selection.build_train_plan(
-            ds,
-            loader=self.loader,
-            context={
-                "trainDelay": self.trainDelay,
-                "retDays": self.retDays,
-                "tsDays": self.tsDays,
-                "prev_date": self._prev_date,
-            },
-        )
+        with self._detail_section("train.build_plan", ds, level="standard"):
+            plan = self.selection.build_train_plan(
+                ds,
+                loader=self.loader,
+                context={
+                    "trainDelay": self.trainDelay,
+                    "retDays": self.retDays,
+                    "tsDays": self.tsDays,
+                    "prev_date": self._prev_date,
+                },
+            )
 
         if self.model is not None:
-            model_data_in_memory = BytesIO()
-            self.model.save(model_data_in_memory)
-            model_data_in_memory.seek(0)
-            self.oldModel = self.research_model_cls(self._model_config())
-            self.oldModel.load(model_data_in_memory)
+            with self._detail_section("train.save_old_model", ds, level="full"):
+                model_data_in_memory = BytesIO()
+                self.model.save(model_data_in_memory)
+                model_data_in_memory.seek(0)
+            with self._detail_section("train.load_old_model", ds, level="full"):
+                self.oldModel = self.research_model_cls(self._model_config())
+                self.oldModel.load(model_data_in_memory)
 
         self.reset_buffer = True
         print(
             f"[TRAIN] ds={ds} target_ds={plan.target_ds} "
             f"loading_days={plan.loading_days} raw_ndays={plan.raw_ndays} ndays={plan.ndays} tsDays={self.tsDays}"
         )
-        dataset = ComboTrainDataset(
-            self.loader,
-            end_ds=plan.target_ds,
-            ndays=plan.ndays,
-            x_delay=self.retDays,
-            step_size=self.tsDays,
-            validinsts=plan.validinsts,
-        )
+        with self._detail_section("train.dataset_init", ds, level="standard"):
+            dataset = ComboTrainDataset(
+                self.loader,
+                end_ds=plan.target_ds,
+                ndays=plan.ndays,
+                x_delay=self.retDays,
+                step_size=self.tsDays,
+                validinsts=plan.validinsts,
+            )
         plan.validinsts = dataset.validinsts
-        self.selection.before_fit(dataset, plan)
+        with self._detail_section("train.before_fit", ds, level="full"):
+            self.selection.before_fit(dataset, plan)
         print(f"[TRAIN] dataset_len={len(dataset)} valid_instruments={dataset.numValidinsts}")
-        self.model = self.research_model_cls(self._model_config())
-        self.model.fit(dataset)
-        self.selection.after_fit(self.model, plan)
+        with self._detail_section("train.model_init", ds, level="full"):
+            self.model = self.research_model_cls(self._model_config())
+        with self._detail_section("train.model_fit", ds, level="standard", kind="mixed"):
+            self.model.fit(dataset)
+        with self._detail_section("train.after_fit", ds, level="full"):
+            self.selection.after_fit(self.model, plan)
         print(f"[TRAIN] finished ds={ds} target_ds={plan.target_ds}")
 
     def needTrain(self, ds: int) -> bool:
