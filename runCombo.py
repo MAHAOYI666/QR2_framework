@@ -190,6 +190,7 @@ def main():
 
             strategy_path = build_strategy_file()
             backtest_node = build_backtest_node(strategy_path, organize_config)
+            backtest_node.monitor = monitor
             backtest = DailyBacktest(backtest_node)
 
         for date in sorted(backtest.vwap_data.index):
@@ -197,7 +198,19 @@ def main():
             with monitor.section("combine", date=date_int):
                 combo.Combine(date_int)
             with monitor.section("alpha_convert", date=date_int):
-                alpha = node.alpha.detach().cpu().to(dtype=node.alpha.dtype).numpy()
+                if isinstance(node.alpha, torch.Tensor):
+                    with monitor.maybe_section("alpha_convert.detach", date=date_int, level="full"):
+                        alpha_tensor = node.alpha.detach()
+                    if alpha_tensor.is_cuda:
+                        with monitor.maybe_section("alpha_convert.cpu_transfer", date=date_int, level="full", kind="mixed"):
+                            alpha_cpu = alpha_tensor.cpu()
+                    else:
+                        with monitor.maybe_section("alpha_convert.cpu_transfer", date=date_int, level="full"):
+                            alpha_cpu = alpha_tensor.cpu()
+                    with monitor.maybe_section("alpha_convert.numpy", date=date_int, level="full"):
+                        alpha = alpha_cpu.to(dtype=node.alpha.dtype).numpy()
+                else:
+                    alpha = np.asarray(node.alpha)
             with monitor.section("backtest_step", date=date_int):
                 metrics = backtest.step(date_int, pd.Series(alpha, index=codes))
             print_daily_metrics(metrics)
