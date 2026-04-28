@@ -28,8 +28,6 @@ class PerfMonitor:
         "cpu_ms",
         "gpu_ms",
         "count",
-        "success",
-        "error",
     ]
     DETAIL_ORDER = {"coarse": 0, "standard": 1, "full": 2}
 
@@ -88,6 +86,8 @@ class PerfMonitor:
         return self._mixed_section(event, date)
 
     def accumulator(self, event: str, date: int | None = None):
+        if not self.enabled:
+            return NullAccumulator()
         return PerfAccumulator(self, event, date)
 
     def detail_enabled(self, level: str) -> bool:
@@ -106,14 +106,8 @@ class PerfMonitor:
     def _section(self, event: str, date: int | None = None):
         start_wall = time.perf_counter()
         start_cpu = time.process_time()
-        success = True
-        error = ""
         try:
             yield
-        except Exception as exc:
-            success = False
-            error = f"{type(exc).__name__}: {exc}"
-            raise
         finally:
             self._sync_cuda_if_needed()
             end_wall = time.perf_counter()
@@ -125,8 +119,6 @@ class PerfMonitor:
                 cpu_ms=(end_cpu - start_cpu) * 1000.0,
                 gpu_ms=None,
                 count=1,
-                success=success,
-                error=error,
             )
 
     @contextmanager
@@ -135,18 +127,13 @@ class PerfMonitor:
             with self._section(event, date):
                 yield
             return
-        success = True
-        error = ""
         start_cpu = time.process_time()
+        start_wall = time.perf_counter()
         start_event = self._torch_cuda.Event(enable_timing=True)
         end_event = self._torch_cuda.Event(enable_timing=True)
         start_event.record()
         try:
             yield
-        except Exception as exc:
-            success = False
-            error = f"{type(exc).__name__}: {exc}"
-            raise
         finally:
             end_event.record()
             try:
@@ -155,31 +142,24 @@ class PerfMonitor:
             except Exception as exc:
                 warnings.warn(f"[PERF] cuda timing failed for {event}: {exc}", RuntimeWarning)
                 gpu_ms = None
+            end_wall = time.perf_counter()
             end_cpu = time.process_time()
             self._write_metric_row(
                 phase=event,
                 date=date,
-                wall_ms=gpu_ms,
-                cpu_ms=(end_cpu - start_cpu) * 1000.0,
+                wall_ms=(end_wall - start_wall) * 1000.0,
+                cpu_ms=None,
                 gpu_ms=gpu_ms,
                 count=1,
-                success=success,
-                error=error,
             )
 
     @contextmanager
     def _mixed_section(self, event: str, date: int | None = None):
-        success = True
-        error = ""
         start_cpu = time.process_time()
         self._torch_cuda.synchronize()
         start_wall = time.perf_counter()
         try:
             yield
-        except Exception as exc:
-            success = False
-            error = f"{type(exc).__name__}: {exc}"
-            raise
         finally:
             self._torch_cuda.synchronize()
             end_wall = time.perf_counter()
@@ -191,8 +171,6 @@ class PerfMonitor:
                 cpu_ms=(end_cpu - start_cpu) * 1000.0,
                 gpu_ms=None,
                 count=1,
-                success=success,
-                error=error,
             )
 
     def close(self):
@@ -237,8 +215,6 @@ class PerfMonitor:
         cpu_ms: float | None,
         gpu_ms: float | None,
         count: int,
-        success: bool = True,
-        error: str = "",
     ):
         self._write_row(
             {
@@ -248,8 +224,6 @@ class PerfMonitor:
                 "cpu_ms": self._format_ms(cpu_ms),
                 "gpu_ms": self._format_ms(gpu_ms),
                 "count": int(count),
-                "success": str(success).lower(),
-                "error": error,
             }
         )
 
@@ -305,3 +279,15 @@ class PerfAccumulator:
             gpu_ms=self.gpu_ms if self.gpu_ms > 0 else None,
             count=self.count,
         )
+
+
+class NullAccumulator:
+    @contextmanager
+    def tick(self):
+        yield
+
+    def add(self, **kwargs):
+        return None
+
+    def flush(self):
+        return None
