@@ -105,7 +105,7 @@ class LoaderConfig:
 
 
 class ComboDataLoader:
-    def __init__(self, config: LoaderConfig, cube_source: FeatureSource | None = None):
+    def __init__(self, config: LoaderConfig, cube_source: FeatureSource | None = None, feature_cache_size: int = 2500, label_cache_size: int = 2500):
         self.config = config
         self.dtype = self.config.dtype
         self.mask = MASK
@@ -119,6 +119,12 @@ class ComboDataLoader:
         self.base_universe_source = MemmapMaskSource(self.config.base_universe_path)
         self.monitor = None
         self.num_features = self.factor_source.feature_dim + self.cube_source.feature_dim
+        self._feature_cache: dict[int, torch.Tensor] = {}
+        self._feature_cache_order: list[int] = []
+        self._feature_cache_size = int(feature_cache_size)
+        self._label_cache: dict[tuple[int, int], tuple[torch.Tensor, torch.Tensor]] = {}
+        self._label_cache_order: list[tuple[int, int]] = []
+        self._label_cache_size = int(label_cache_size)
 
     def _sync_monitor_refs(self):
         self.factor_source.monitor = self.monitor
@@ -139,8 +145,31 @@ class ComboDataLoader:
         aligned = self.didx2date(self.date2didx(ds))
         return max(aligned, self.data_start_ds)
 
+
+    def _cache_get(self, cache: dict, order: list, key):
+        if key not in cache:
+            return None
+        order.remove(key)
+        order.append(key)
+        return cache[key]
+
+    def _cache_set(self, cache: dict, order: list, key, value, max_size: int):
+        if max_size <= 0:
+            return
+        if key in cache:
+            order.remove(key)
+        cache[key] = value
+        order.append(key)
+        while len(order) > max_size:
+            stale_key = order.pop(0)
+            cache.pop(stale_key, None)
+
     def gen_feature(self, ds: int) -> torch.Tensor:
         ds = self.align_date(ds)
+        cached = self._cache_get(self._feature_cache, self._feature_cache_order, ds)
+        if cached is not None:
+            return cached
+
         self._sync_monitor_refs()
         with _maybe_section(self.monitor, "gen_feature.factor_load", ds, level="full"):
             factor = self.factor_source.load_day(ds).to(torch.float32)
@@ -156,7 +185,10 @@ class ComboDataLoader:
         with _maybe_section(self.monitor, "gen_feature.truncate_nan_to_num", ds, level="full"):
             feature = truncate(feature, -4.0, 4.0)
             feature = nan_to_num(feature, 0.0)
-        return feature.to(self.dtype)
+
+        feature = feature.to(self.dtype)
+        self._cache_set(self._feature_cache, self._feature_cache_order, ds, feature, self._feature_cache_size)
+        return feature
 
     def gen_base_universe_mask(self, ds: int) -> torch.Tensor:
         ds = self.align_date(ds)
@@ -170,6 +202,11 @@ class ComboDataLoader:
 
     def gen_label(self, ds: int, ret_days: int = 1) -> tuple[torch.Tensor, torch.Tensor]:
         ds = self.align_date(ds)
+        cache_key = (ds, int(ret_days))
+        cached = self._cache_get(self._label_cache, self._label_cache_order, cache_key)
+        if cached is not None:
+            return cached
+
         end_didx = self.date2didx(ds)
         start_didx = end_didx - ret_days + 1
         if start_didx < self.data_start_didx:
@@ -198,7 +235,9 @@ class ComboDataLoader:
 
         cret[~valid_mask] = 0.0
         cret = nan_to_num(cret, 0.0).to(self.dtype)
-        return cret, to_bool_mask(valid_mask)
+        label = (cret, to_bool_mask(valid_mask))
+        self._cache_set(self._label_cache, self._label_cache_order, cache_key, label, self._label_cache_size)
+        return label
 
     def _feature_available_mask(self, feature_window: torch.Tensor) -> torch.Tensor:
         per_day_available = torch.isnan(feature_window).sum(dim=-1) == 0
