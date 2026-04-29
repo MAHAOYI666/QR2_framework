@@ -54,6 +54,16 @@ class DailyBacktest:
         self._load_market_data()
         self.initialize()
 
+    def _monitor(self):
+        return getattr(self.node, "monitor", None)
+
+    def _section(self, name: str, date: int | None = None, *, level: str = "full"):
+        monitor = self._monitor()
+        if monitor is None:
+            from contextlib import nullcontext
+            return nullcontext()
+        return monitor.maybe_section(name, date=date, level=level)
+
     def _init_strategy(self):
         file_path = self.node.strategy_path
         class_name = self.node.strategy_class
@@ -137,12 +147,13 @@ class DailyBacktest:
         return float(stock_value + self.cash)
 
     def _append_daily_metrics(self, metrics: dict):
-        pd.DataFrame([metrics]).to_csv(
-            self.daily_metrics_path,
-            mode="a",
-            header=not self.node.daily_metrics_written,
-            index=False,
-        )
+        with self._section("step.csv_append", metrics.get("date"), level="full"):
+            pd.DataFrame([metrics]).to_csv(
+                self.daily_metrics_path,
+                mode="a",
+                header=not self.node.daily_metrics_written,
+                index=False,
+            )
         self.node.daily_metrics_written = True
 
     def _log(self, message: str):
@@ -150,37 +161,42 @@ class DailyBacktest:
             print(message)
 
     def _fetch_benchmark_data(self) -> pd.DataFrame:
-        pro = Querytool()
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", FutureWarning)
-            bench_raw = pro.index_daily(
-                ts_code="000905.SH",
-                target_columns=["close"],
-                start_date=self.node.start_ds,
-                end_date=self.node.end_ds,
-            )
-        return pd.DataFrame(bench_raw).copy()
+        with self._section("finalize.fetch_benchmark", level="full"):
+            pro = Querytool()
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", FutureWarning)
+                bench_raw = pro.index_daily(
+                    ts_code="000905.SH",
+                    target_columns=["close"],
+                    start_date=self.node.start_ds,
+                    end_date=self.node.end_ds,
+                )
+            return pd.DataFrame(bench_raw).copy()
 
     def step(self, date: int, alpha: pd.Series | np.ndarray) -> dict:
         date = self._align_date(date)
         if self.node.yesterday is not None and date <= self.node.yesterday:
             raise ValueError(f"date {date} must be later than previous date {self.node.yesterday}")
 
-        self._advance_from_previous_close(date)
+        with self._section("step.advance_close", date, level="standard"):
+            self._advance_from_previous_close(date)
         vwap_today = self.vwap_data.loc[date]
-        signals = self._coerce_alpha(alpha).fillna(0.0)
-        signal_masked = signals * self.universe.loc[date].fillna(0.0)
-        target_weight = self.strategy.generate_positions(signal_masked, self.node.last_hold)
+        with self._section("step.coerce_alpha", date, level="standard"):
+            signals = self._coerce_alpha(alpha).fillna(0.0)
+            signal_masked = signals * self.universe.loc[date].fillna(0.0)
+        with self._section("step.generate_positions", date, level="standard"):
+            target_weight = self.strategy.generate_positions(signal_masked, self.node.last_hold)
         self.node.position_history.append(pd.DataFrame([target_weight], index=[date], columns=self.universe.columns))
         tvr_cost = 0.0
 
-        if self.node.weight_index is not None:
-            diff = self.node.weight_index.difference(target_weight.index)
-            if len(diff) > 0:
-                k_value = (self.node.holdings.loc[diff] * vwap_today.loc[diff]).sum()
-                tvr_cost += k_value
-                self.cash += k_value * (1 - self.node.fee_rate)
-                self.node.holdings.loc[diff] = 0
+        with self._section("step.diff_index", date, level="standard"):
+            if self.node.weight_index is not None:
+                diff = self.node.weight_index.difference(target_weight.index)
+                if len(diff) > 0:
+                    k_value = (self.node.holdings.loc[diff] * vwap_today.loc[diff]).sum()
+                    tvr_cost += k_value
+                    self.cash += k_value * (1 - self.node.fee_rate)
+                    self.node.holdings.loc[diff] = 0
         self.node.weight_index = target_weight.index
 
         total_asset = self._total_asset(vwap_today)
@@ -189,34 +205,72 @@ class DailyBacktest:
         diff_value = target_value - current_value
         trade_cost = 0.0
 
-        for stock in self.node.weight_index:
-            if (stock not in vwap_today) or pd.isna(vwap_today[stock]) or pd.isna(self.suspend.loc[date, stock]) or pd.isna(self.limit.loc[date, stock]):
-                continue
+        monitor = self._monitor()
+        acc_check = monitor.accumulator("trade_loop.suspend_limit_check", date=date) if monitor else None
+        acc_buy = monitor.accumulator("trade_loop.buy_branch", date=date) if monitor else None
+        acc_sell = monitor.accumulator("trade_loop.sell_branch", date=date) if monitor else None
+        with self._section("step.trade_loop", date, level="standard"):
+            for stock in self.node.weight_index:
+                if acc_check is not None and monitor.detail_enabled("full"):
+                    with acc_check.tick():
+                        skip = (stock not in vwap_today) or pd.isna(vwap_today[stock]) or pd.isna(self.suspend.loc[date, stock]) or pd.isna(self.limit.loc[date, stock])
+                else:
+                    skip = (stock not in vwap_today) or pd.isna(vwap_today[stock]) or pd.isna(self.suspend.loc[date, stock]) or pd.isna(self.limit.loc[date, stock])
+                if skip:
+                    continue
 
-            price_per_share = vwap_today[stock]
-            price_per_100_shares = price_per_share * 100
-            value_diff = diff_value[stock]
+                price_per_share = vwap_today[stock]
+                price_per_100_shares = price_per_share * 100
+                value_diff = diff_value[stock]
 
-            if value_diff > 0:
-                max_lots = int(self.cash // (price_per_100_shares * (1 + self.node.fee_rate)))
-                target_lots = int(value_diff // (price_per_100_shares * (1 + self.node.fee_rate)))
-                buy_lots = min(target_lots, max_lots)
-                if buy_lots > 0:
-                    b_value = buy_lots * price_per_100_shares
-                    cost = b_value * (1 + self.node.fee_rate)
-                    trade_cost += buy_lots * price_per_100_shares * self.node.fee_rate
-                    self.cash -= cost
-                    self.node.holdings[stock] += buy_lots * 100
-                    tvr_cost += b_value
-            elif value_diff < 0:
-                sell_value = -value_diff
-                shares_to_sell = min(self.node.holdings[stock], (sell_value // price_per_100_shares + 1) * 100)
-                s_value = shares_to_sell * price_per_share
-                proceeds = s_value * (1 - self.node.fee_rate)
-                trade_cost += s_value * self.node.fee_rate
-                self.cash += proceeds
-                self.node.holdings[stock] -= shares_to_sell
-                tvr_cost += s_value
+                if value_diff > 0:
+                    if acc_buy is not None and monitor.detail_enabled("full"):
+                        with acc_buy.tick():
+                            max_lots = int(self.cash // (price_per_100_shares * (1 + self.node.fee_rate)))
+                            target_lots = int(value_diff // (price_per_100_shares * (1 + self.node.fee_rate)))
+                            buy_lots = min(target_lots, max_lots)
+                            if buy_lots > 0:
+                                b_value = buy_lots * price_per_100_shares
+                                cost = b_value * (1 + self.node.fee_rate)
+                                trade_cost += buy_lots * price_per_100_shares * self.node.fee_rate
+                                self.cash -= cost
+                                self.node.holdings[stock] += buy_lots * 100
+                                tvr_cost += b_value
+                    else:
+                        max_lots = int(self.cash // (price_per_100_shares * (1 + self.node.fee_rate)))
+                        target_lots = int(value_diff // (price_per_100_shares * (1 + self.node.fee_rate)))
+                        buy_lots = min(target_lots, max_lots)
+                        if buy_lots > 0:
+                            b_value = buy_lots * price_per_100_shares
+                            cost = b_value * (1 + self.node.fee_rate)
+                            trade_cost += buy_lots * price_per_100_shares * self.node.fee_rate
+                            self.cash -= cost
+                            self.node.holdings[stock] += buy_lots * 100
+                            tvr_cost += b_value
+                elif value_diff < 0:
+                    if acc_sell is not None and monitor.detail_enabled("full"):
+                        with acc_sell.tick():
+                            sell_value = -value_diff
+                            shares_to_sell = min(self.node.holdings[stock], (sell_value // price_per_100_shares + 1) * 100)
+                            s_value = shares_to_sell * price_per_share
+                            proceeds = s_value * (1 - self.node.fee_rate)
+                            trade_cost += s_value * self.node.fee_rate
+                            self.cash += proceeds
+                            self.node.holdings[stock] -= shares_to_sell
+                            tvr_cost += s_value
+                    else:
+                        sell_value = -value_diff
+                        shares_to_sell = min(self.node.holdings[stock], (sell_value // price_per_100_shares + 1) * 100)
+                        s_value = shares_to_sell * price_per_share
+                        proceeds = s_value * (1 - self.node.fee_rate)
+                        trade_cost += s_value * self.node.fee_rate
+                        self.cash += proceeds
+                        self.node.holdings[stock] -= shares_to_sell
+                        tvr_cost += s_value
+        if acc_check is not None and monitor.detail_enabled("full"):
+            acc_check.flush()
+            acc_buy.flush()
+            acc_sell.flush()
 
         close_today = self.close_data.loc[date]
         total = self._total_asset(close_today)
@@ -225,19 +279,20 @@ class DailyBacktest:
         tvr = float(tvr_cost / target_value.sum()) if target_value.sum() != 0 else 0.0
         long_num = int((self.node.holdings > 0).sum())
 
-        metrics = {
-            "date": int(date),
-            "total_asset": float(total),
-            "pnl": pnl,
-            "trade_cost": float(trade_cost),
-            "reserve_cash": float(self.cash),
-            "tvr": tvr,
-            "long_num": long_num,
-        }
-        self.node.daily_metrics_history.append(metrics)
-        self.node.asset_history.append([date, total, trade_cost, self.cash, tvr, long_num])
-        self.node.hold_history.append(self.node.holdings.rename(date))
-        self._append_daily_metrics(metrics)
+        with self._section("step.finalize_metrics", date, level="standard"):
+            metrics = {
+                "date": int(date),
+                "total_asset": float(total),
+                "pnl": pnl,
+                "trade_cost": float(trade_cost),
+                "reserve_cash": float(self.cash),
+                "tvr": tvr,
+                "long_num": long_num,
+            }
+            self.node.daily_metrics_history.append(metrics)
+            self.node.asset_history.append([date, total, trade_cost, self.cash, tvr, long_num])
+            self.node.hold_history.append(self.node.holdings.rename(date))
+            self._append_daily_metrics(metrics)
         self.node.yesterday = date
         self._log(
             f"date: {date}, total: {total:.2f}, trade_cost: {trade_cost:.2f}, "
@@ -250,24 +305,29 @@ class DailyBacktest:
         }
 
     def finalize(self):
-        if self.node.position_history:
-            self.position_data = pd.concat(self.node.position_history)
-        else:
-            self.position_data = pd.DataFrame(columns=self.universe.columns)
-        if self.node.hold_history:
-            self.hold_history = pd.concat(self.node.hold_history, axis=1).transpose()
-        else:
-            self.hold_history = pd.DataFrame(columns=self.universe.columns)
+        with self._section("finalize.concat_position", level="standard"):
+            if self.node.position_history:
+                self.position_data = pd.concat(self.node.position_history)
+            else:
+                self.position_data = pd.DataFrame(columns=self.universe.columns)
+        with self._section("finalize.concat_holdings", level="standard"):
+            if self.node.hold_history:
+                self.hold_history = pd.concat(self.node.hold_history, axis=1).transpose()
+            else:
+                self.hold_history = pd.DataFrame(columns=self.universe.columns)
         self.asset_history = pd.DataFrame(
             self.node.asset_history,
             columns=["date", "total_asset", "trade_cost", "reserve_cash", "tvr", "long_num"],
         ).set_index("date")
-        summary = self._pnl_summary()
-        self.draw()
+        with self._section("finalize.pnl_summary", level="standard"):
+            summary = self._pnl_summary()
+        with self._section("finalize.draw", level="standard"):
+            self.draw()
         prefix = f"{self.node.strategy_class}_{self.node.start_ds}_{self.node.end_ds}"
-        self.asset_history.to_csv(os.path.join(self.node.output_path, f"{prefix}_yield.csv"))
-        self.position_data.to_csv(os.path.join(self.node.output_path, f"{prefix}_position.csv"))
-        self.hold_history.to_csv(os.path.join(self.node.output_path, f"{prefix}_holdings.csv"))
+        with self._section("finalize.csv_dump", level="full"):
+            self.asset_history.to_csv(os.path.join(self.node.output_path, f"{prefix}_yield.csv"))
+            self.position_data.to_csv(os.path.join(self.node.output_path, f"{prefix}_position.csv"))
+            self.hold_history.to_csv(os.path.join(self.node.output_path, f"{prefix}_holdings.csv"))
         return summary
 
     def setup_plot(self, title, xlabel, ylabel):

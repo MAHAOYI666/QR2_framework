@@ -84,6 +84,7 @@ DEFAULT_CONFIG = {
         "print_summary": True,
         "collect_gpu": True,
         "sync_cuda": False,
+        "detail_level": "coarse",
     },
 }
 
